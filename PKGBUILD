@@ -98,7 +98,7 @@ prepare() {
     # Clone whisper.cpp if not present
     if [ ! -d "whisper.cpp" ]; then
         printf "Cloning whisper.cpp...\n"
-        git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git
+        git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
     fi
 }
 

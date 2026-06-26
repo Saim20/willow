@@ -45,6 +45,7 @@ systemctl --user start willow.service
 ```bash
 # Install dependencies (Arch Linux example)
 sudo pacman -S gnome-shell sdbus-cpp jsoncpp libpulse ydotool cmake git gcc
+# sdbus-c++ 2.x requires a C++20-capable compiler (GCC 10+ or Clang 12+)
 
 # Clone the repository
 git clone https://github.com/Saim20/willow.git
@@ -242,15 +243,18 @@ See `config.json` in the repository for the full structure.
 ### Building from Source
 
 ```bash
-# Clone with submodules
+# Clone with the whisper.cpp submodule
 git clone --recursive https://github.com/Saim20/willow.git
 cd willow
 
-# Build service
+# If you already cloned without submodules:
+# git submodule update --init --recursive
+
+# Build service (whisper.cpp is fetched automatically if the submodule is missing)
 cd service
 mkdir build && cd build
 cmake ..
-make
+make -j$(nproc)
 
 # Run service directly
 ./willow-service
