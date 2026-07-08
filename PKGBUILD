@@ -25,7 +25,7 @@ optdepends=(
 )
 options=('!debug')
 install=willow.install
-source=("willow::git+https://github.com/Saim20/willow.git")
+source=("willow::git+https://github.com/Saim20/willow.git#tag=v3.0.0")
 sha256sums=('SKIP')
 
 build() {
