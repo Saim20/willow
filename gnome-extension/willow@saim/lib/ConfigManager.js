@@ -6,18 +6,7 @@
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-
-const VoiceAssistantIface = `
-  <node>
-  <interface name="com.github.saim.Willow">
-    <method name="UpdateConfig">
-      <arg direction="in" type="s" name="config"/>
-    </method>
-  </interface>
-  </node>
-`;
-
-const VoiceAssistantProxy = Gio.DBusProxy.makeProxyWrapper(VoiceAssistantIface);
+import {createVoiceAssistantProxy} from './DbusInterface.js';
 
 export class ConfigManager {
     constructor(settings) {
@@ -34,11 +23,11 @@ export class ConfigManager {
      */
     _initDbusProxy() {
         try {
-            this._proxy = new VoiceAssistantProxy(
-                Gio.DBus.session,
-                'com.github.saim.Willow',
-                '/com/github/saim/VoiceAssistant'
-            );
+            this._proxy = createVoiceAssistantProxy((proxy, error) => {
+                if (error) {
+                    console.log(`ConfigManager: Could not connect to D-Bus service: ${error}`);
+                }
+            });
         } catch (e) {
             console.log(`ConfigManager: Could not connect to D-Bus service: ${e}`);
         }
@@ -156,8 +145,6 @@ export class ConfigManager {
         // Update basic settings
         config.hotword = this._settings.get_string('hotword');
         config.command_threshold = this._settings.get_int('command-threshold');
-        config.processing_interval = this._settings.get_double('processing-interval');
-        config.gpu_acceleration = this._settings.get_boolean('gpu-acceleration');
 
         return this.saveConfig(config);
     }
@@ -168,10 +155,45 @@ export class ConfigManager {
     syncConfigToSettings() {
         const config = this.getConfig();
         
-        this._settings.set_string('hotword', config.hotword || 'hey');
+        this._settings.set_string('hotword', config.hotword || 'hey willow');
         this._settings.set_int('command-threshold', config.command_threshold || 80);
-        this._settings.set_double('processing-interval', config.processing_interval || 1.5);
-        this._settings.set_boolean('gpu-acceleration', config.gpu_acceleration || false);
+    }
+
+    /**
+     * Apply config pushed from the D-Bus service without writing back to disk
+     */
+    applyConfigFromService(config) {
+        if (!config) {
+            return;
+        }
+
+        this._config = this._filterComments(config);
+        this.syncConfigToSettings();
+    }
+
+    /**
+     * Load config from the running service via D-Bus
+     */
+    loadConfigFromService(callback) {
+        if (!this._proxy) {
+            callback(this.getConfig(), new Error('Service not connected'));
+            return;
+        }
+
+        this._proxy.GetConfigRemote((result, error) => {
+            if (error) {
+                callback(this.getConfig(), error);
+                return;
+            }
+
+            try {
+                const config = JSON.parse(result[0]);
+                this._config = this._filterComments(config);
+                callback(this._config, null);
+            } catch (e) {
+                callback(this.getConfig(), e);
+            }
+        });
     }
 
     /**
@@ -232,14 +254,8 @@ export class ConfigManager {
      */
     _getDefaultConfig() {
         return {
-            "hotword": "hey",
+            "hotword": "hey willow",
             "command_threshold": 80,
-            "processing_interval": 1.5,
-            "gpu_acceleration": false,
-            "logging": {
-                "level": "INFO",
-                "file": "/tmp/willow.log"
-            },
             "commands": [],
             "typing_mode": {
                 "exit_phrases": [

@@ -1,42 +1,40 @@
 #pragma once
 
 #include "CommandExecutor.hpp"
-#include "SpeechSegmenter.hpp"
+#include "SpeechPipeline.hpp"
+#include "CommandIntentResolver.hpp"
+#include "Types.hpp"
 #include <string>
 #include <memory>
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 namespace VoiceAssistant {
 
-/**
- * Base class for mode workers
- */
 class ModeWorker {
 public:
     using ModeChangeCallback = std::function<void(const std::string&)>;
     
     virtual ~ModeWorker() = default;
     
-    // Lifecycle
     virtual void start() = 0;
     virtual void stop() = 0;
     virtual bool isRunning() const = 0;
     
-    // Process transcribed text
-    virtual void processTranscription(const std::string& text) = 0;
+    virtual void processTranscription(const TranscriptionResult& result) = 0;
+    virtual void processKeyword(const std::string& keyword) = 0;
     
-    // Set mode change callback
     void setModeChangeCallback(ModeChangeCallback callback) {
         m_modeChangeCallback = callback;
     }
     
-    // Get current buffer (for display)
     virtual std::string getBuffer() const = 0;
 
 protected:
     ModeChangeCallback m_modeChangeCallback;
     std::shared_ptr<CommandExecutor> m_executor;
+    std::shared_ptr<SpeechPipeline> m_pipeline;
     
     void requestModeChange(const std::string& newMode) {
         if (m_modeChangeCallback) {
@@ -45,101 +43,70 @@ protected:
     }
 };
 
-/**
- * NormalModeWorker - Power-efficient hotword detection
- * 
- * Uses a lightweight approach:
- * - Smaller audio buffers (500ms instead of 2s)
- * - Simple energy-based pre-filtering before whisper
- * - Only transcribes when energy suggests speech
- */
 class NormalModeWorker : public ModeWorker {
 public:
     NormalModeWorker(std::shared_ptr<CommandExecutor> executor,
-                     std::shared_ptr<SpeechSegmenter> segmenter);
-    ~NormalModeWorker() override = default;
+                     std::shared_ptr<SpeechPipeline> pipeline);
     
     void start() override;
     void stop() override;
     bool isRunning() const override { return m_isRunning; }
     
-    void processTranscription(const std::string& text) override;
+    void processTranscription(const TranscriptionResult& result) override;
+    void processKeyword(const std::string& keyword) override;
     
     void setHotword(const std::string& hotword) { m_hotword = hotword; }
-    
-    std::string getBuffer() const override { return ""; }  // No buffer in normal mode
+    std::string getBuffer() const override { return ""; }
 
 private:
-    std::atomic<bool> m_isRunning;
+    std::atomic<bool> m_isRunning{false};
     std::string m_hotword;
-    std::shared_ptr<SpeechSegmenter> m_segmenter;
 };
 
-/**
- * CommandModeWorker - Command matching and execution
- */
 class CommandModeWorker : public ModeWorker {
 public:
+    using CommandExecutedCallback = std::function<void(const std::string&, const std::string&, double)>;
+
     CommandModeWorker(std::shared_ptr<CommandExecutor> executor,
-                      std::shared_ptr<SpeechSegmenter> segmenter);
-    ~CommandModeWorker() override = default;
+                      std::shared_ptr<SpeechPipeline> pipeline);
     
     void start() override;
     void stop() override;
     bool isRunning() const override { return m_isRunning; }
     
-    void processTranscription(const std::string& text) override;
+    void processTranscription(const TranscriptionResult& result) override;
+    void processKeyword(const std::string& keyword) override;
     
     void setCommands(const std::vector<Command>& commands);
-    void setThreshold(double threshold) { m_threshold = threshold; }
+    void setThreshold(double threshold);
+    void setCommandExecutedCallback(CommandExecutedCallback callback) {
+        m_commandExecutedCallback = callback;
+    }
     
     std::string getBuffer() const override;
 
 private:
-    std::atomic<bool> m_isRunning;
-    std::shared_ptr<SpeechSegmenter> m_segmenter;
-    
-    std::vector<Command> m_commands;
-    mutable std::mutex m_commandsMutex;
-    
-    double m_threshold;
+    std::atomic<bool> m_isRunning{false};
+    CommandExecutedCallback m_commandExecutedCallback;
     
     std::string m_buffer;
     mutable std::mutex m_bufferMutex;
-    
-    // Duplicate prevention
-    struct ExecutionRecord {
-        std::string commandName;
-        std::chrono::steady_clock::time_point timestamp;
-    };
-    std::vector<ExecutionRecord> m_executionHistory;
-    std::mutex m_historyMutex;
-    
-    bool isDuplicate(const std::string& commandName);
-    void recordExecution(const std::string& commandName);
-    void cleanHistory();
-    
-    // Smart workflow handlers
-    bool processSmartOpen(const std::string& text);
-    bool processSmartSearch(const std::string& text);
-    std::string extractAppName(const std::string& text, const std::string& trigger);
-    std::pair<std::string, std::string> extractSearchQuery(const std::string& text);
+
+    void dispatchResult(const CommandDispatchResult& result);
+    void executeDispatch(const CommandDispatchResult& result);
 };
 
-/**
- * TypingModeWorker - Speech-to-text typing
- */
 class TypingModeWorker : public ModeWorker {
 public:
     TypingModeWorker(std::shared_ptr<CommandExecutor> executor,
-                     std::shared_ptr<SpeechSegmenter> segmenter);
-    ~TypingModeWorker() override = default;
+                     std::shared_ptr<SpeechPipeline> pipeline);
     
     void start() override;
     void stop() override;
     bool isRunning() const override { return m_isRunning; }
     
-    void processTranscription(const std::string& text) override;
+    void processTranscription(const TranscriptionResult& result) override;
+    void processKeyword(const std::string& keyword) override;
     
     void setExitPhrases(const std::vector<std::string>& phrases) {
         m_exitPhrases = phrases;
@@ -148,15 +115,13 @@ public:
     std::string getBuffer() const override;
 
 private:
-    std::atomic<bool> m_isRunning;
-    std::shared_ptr<SpeechSegmenter> m_segmenter;
-    
+    std::atomic<bool> m_isRunning{false};
     std::vector<std::string> m_exitPhrases;
     
     std::string m_buffer;
     mutable std::mutex m_bufferMutex;
     
-    bool checkExitPhrases(const std::string& text);
+    bool checkExitPhrases(const std::string& text) const;
 };
 
 } // namespace VoiceAssistant

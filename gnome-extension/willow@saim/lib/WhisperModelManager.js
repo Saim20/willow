@@ -1,6 +1,6 @@
 /**
- * WhisperModelManager.js - Whisper model download and management
- * Handles downloading and selecting whisper.cpp models
+ * WhisperModelManager.js - Sherpa-onnx model download and management
+ * Handles downloading and verifying sherpa speech models for Willow
  */
 
 import Adw from 'gi://Adw';
@@ -9,151 +9,84 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 export class WhisperModelManager {
-    constructor() {
+    constructor(configManager = null) {
+        this._configManager = configManager;
         this._modelDir = GLib.get_home_dir() + '/.local/share/willow/models';
         this._downloadInProgress = false;
-        this._refreshing = false;
-        
-        // Available whisper models with their details
-        this._availableModels = [
+
+        this._bundles = [
             {
-                name: 'tiny.en',
-                file: 'ggml-tiny.en.bin',
-                size: '~75 MB',
-                description: 'Fastest, good accuracy (English only)',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin',
-                recommended: true
+                id: 'kws',
+                name: 'Keyword Spotting',
+                description: 'Low-latency hotword and mode-control detection',
+                size: '~15 MB',
+                check: () => this._hasOnnxFiles(`${this._modelDir}/kws`),
             },
             {
-                name: 'tiny',
-                file: 'ggml-tiny.bin',
-                size: '~75 MB',
-                description: 'Fast, multilingual support',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin',
-                recommended: false
+                id: 'streaming',
+                name: 'Streaming ASR',
+                description: 'Real-time speech recognition for command and typing modes',
+                size: '~120 MB',
+                check: () => this._hasOnnxFiles(`${this._modelDir}/streaming`),
             },
             {
-                name: 'base.en',
-                file: 'ggml-base.en.bin',
-                size: '~142 MB',
-                description: 'Better accuracy (English only)',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin',
-                recommended: false
+                id: 'speaker',
+                name: 'Speaker Verification',
+                description: 'Voice profile matching after hotword activation',
+                size: '~25 MB',
+                check: () => Gio.File.new_for_path(`${this._modelDir}/speaker/model.onnx`).query_exists(null),
             },
-            {
-                name: 'base',
-                file: 'ggml-base.bin',
-                size: '~142 MB',
-                description: 'Better accuracy, multilingual',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
-                recommended: false
-            },
-            {
-                name: 'small.en',
-                file: 'ggml-small.en.bin',
-                size: '~466 MB',
-                description: 'High accuracy (English only)',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin',
-                recommended: false
-            },
-            {
-                name: 'small',
-                file: 'ggml-small.bin',
-                size: '~466 MB',
-                description: 'High accuracy, multilingual',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
-                recommended: false
-            },
-            {
-                name: 'medium.en',
-                file: 'ggml-medium.en.bin',
-                size: '~1.5 GB',
-                description: 'Very high accuracy (English only)',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin',
-                recommended: false
-            },
-            {
-                name: 'medium',
-                file: 'ggml-medium.bin',
-                size: '~1.5 GB',
-                description: 'Very high accuracy, multilingual',
-                url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin',
-                recommended: false
-            }
         ];
     }
 
-    /**
-     * Create the model management preferences group
-     */
     createModelGroup(window) {
         const group = new Adw.PreferencesGroup({
-            title: 'Whisper Models',
-            description: 'Download and manage speech recognition models',
+            title: 'Speech Models',
+            description: 'Sherpa-onnx models for keyword spotting, streaming ASR, and speaker verification',
         });
 
-        // Store references for dynamic updates
+        this._group = group;
+        this._window = window;
         this._statusRow = null;
-        this._expanderRow = null;
-        this._modelRows = new Map(); // model.file -> row reference
-        
-        // Build initial content
-        this._buildGroupContent(group, window);
+        this._bundleRows = new Map();
 
+        this._buildGroupContent();
         return group;
     }
-    
-    /**
-     * Build or rebuild the group content
-     */
-    _buildGroupContent(group, window) {
-        // Current model status
-        const currentModelFile = this._getCurrentModel();
-        let currentModelName = currentModelFile;
-        if (currentModelFile) {
-            const model = this._availableModels.find(m => m.file === currentModelFile);
-            if (model) currentModelName = model.name;
-        }
+
+    _buildGroupContent() {
         this._statusRow = new Adw.ActionRow({
-            title: 'Current Model',
-            subtitle: currentModelFile ? `Using ${currentModelName}` : 'No model detected',
+            title: 'Model Status',
+            subtitle: 'Checking…',
         });
-        
-        if (currentModelFile) {
-            const sizeInfo = this._getModelSize(currentModelFile);
-            if (sizeInfo) {
-                const sizeLabel = new Gtk.Label({
-                    label: sizeInfo,
-                    css_classes: ['dim-label'],
-                    valign: Gtk.Align.CENTER,
-                });
-                this._statusRow.add_suffix(sizeLabel);
-            }
-        }
-        
-        group.add(this._statusRow);
+        this._group.add(this._statusRow);
 
-        // Add expander for available models
-        this._expanderRow = new Adw.ExpanderRow({
-            title: 'Available Models',
-            subtitle: 'Download and select whisper.cpp models',
-        });
-
-        this._modelRows.clear();
-        for (const model of this._availableModels) {
-            const modelRow = this._createModelRow(model, window, () => this._refreshUI(group, window));
-            this._expanderRow.add_row(modelRow);
-            this._modelRows.set(model.file, modelRow);
+        for (const bundle of this._bundles) {
+            const row = new Adw.ActionRow({
+                title: bundle.name,
+                subtitle: `${bundle.description} • ${bundle.size}`,
+            });
+            this._bundleRows.set(bundle.id, row);
+            this._group.add(row);
         }
 
-        group.add(this._expanderRow);
+        const downloadRow = new Adw.ActionRow({
+            title: 'Download All Models',
+            subtitle: 'Runs willow-download-model (~160 MB total)',
+        });
+        const downloadButton = new Gtk.Button({
+            icon_name: 'folder-download-symbolic',
+            label: 'Download',
+            valign: Gtk.Align.CENTER,
+        });
+        downloadButton.connect('clicked', () => this._downloadAll(this._window, downloadButton));
+        downloadRow.add_suffix(downloadButton);
+        this._group.add(downloadRow);
 
-        // Model directory info
         const dirRow = new Adw.ActionRow({
             title: 'Model Directory',
             subtitle: this._modelDir,
         });
-
         const openDirButton = new Gtk.Button({
             icon_name: 'folder-open-symbolic',
             valign: Gtk.Align.CENTER,
@@ -161,206 +94,67 @@ export class WhisperModelManager {
         });
         openDirButton.connect('clicked', () => this._openModelDirectory());
         dirRow.add_suffix(openDirButton);
+        this._group.add(dirRow);
 
-        group.add(dirRow);
-    }
-    
-    /**
-     * Refresh the UI after model changes
-     */
-    _refreshUI(group, window) {
-        if (this._refreshing) return;
-        this._refreshing = true;
-        
-        // Schedule UI update on next idle cycle to avoid race conditions
-        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            // Remove all children
-            let child = group.get_first_child();
-            while (child) {
-                const next = child.get_next_sibling();
-                group.remove(child);
-                child = next;
-            }
-            
-            // Rebuild content
-            this._buildGroupContent(group, window);
-            
-            this._refreshing = false;
-            return GLib.SOURCE_REMOVE;
-        });
+        this._refreshUI();
     }
 
-    /**
-     * Create a row for each model
-     */
-    _createModelRow(model, window, refreshCallback) {
-        const isInstalled = this._isModelInstalled(model.file);
-        const currentModel = this._getCurrentModel();
-        const isCurrent = currentModel === model.file;
-        
-        let subtitle = `${model.description} • ${model.size}`;
-        if (model.recommended) {
-            subtitle = '⭐ Recommended • ' + subtitle;
+    _hasOnnxFiles(dirPath) {
+        const dir = Gio.File.new_for_path(dirPath);
+        if (!dir.query_exists(null)) {
+            return false;
         }
-        if (isInstalled && isCurrent) {
-            subtitle += ' • Currently Active';
-        } else if (isInstalled) {
-            subtitle += ' • Installed';
-        }
-
-        const row = new Adw.ActionRow({
-            title: model.name,
-            subtitle: subtitle,
-        });
-
-        // Create button box
-        const buttonBox = new Gtk.Box({
-            spacing: 6,
-            valign: Gtk.Align.CENTER,
-        });
-
-        if (isInstalled) {
-            // Select button
-            if (!isCurrent) {
-                const selectButton = new Gtk.Button({
-                    icon_name: 'emblem-ok-symbolic',
-                    tooltip_text: 'Use this model',
-                    css_classes: ['suggested-action'],
-                });
-                selectButton.connect('clicked', () => {
-                    this._selectModel(model, window, refreshCallback);
-                });
-                buttonBox.append(selectButton);
-            }
-
-            // Delete button
-            const deleteButton = new Gtk.Button({
-                icon_name: 'user-trash-symbolic',
-                tooltip_text: 'Delete model',
-                css_classes: ['destructive-action'],
-            });
-            deleteButton.connect('clicked', () => {
-                this._deleteModel(model, window, refreshCallback);
-            });
-            buttonBox.append(deleteButton);
-        } else {
-            // Download button
-            const downloadButton = new Gtk.Button({
-                icon_name: 'folder-download-symbolic',
-                label: 'Download',
-                tooltip_text: `Download ${model.name} model`,
-            });
-            downloadButton.connect('clicked', () => {
-                this._downloadModel(model, window, downloadButton, refreshCallback);
-            });
-            buttonBox.append(downloadButton);
-        }
-
-        row.add_suffix(buttonBox);
-        return row;
-    }
-
-    /**
-     * Check if a model is installed
-     */
-    _isModelInstalled(filename) {
-        const file = Gio.File.new_for_path(`${this._modelDir}/${filename}`);
-        return file.query_exists(null);
-    }
-
-    /**
-     * Get current model from config file, or fallback to checking directory
-     */
-    _getCurrentModel() {
         try {
-            // First, try to read from config file
-            const configPath = GLib.get_home_dir() + '/.config/willow/config.json';
-            const configFile = Gio.File.new_for_path(configPath);
-            
-            if (configFile.query_exists(null)) {
-                let [success, contents] = configFile.load_contents(null);
-                if (success) {
-                    const config = JSON.parse(new TextDecoder().decode(contents));
-                    if (config.whisper_model) {
-                        // Verify the model file actually exists
-                        const modelFile = Gio.File.new_for_path(`${this._modelDir}/${config.whisper_model}`);
-                        if (modelFile.query_exists(null)) {
-                            return config.whisper_model;
-                        }
-                    }
+            const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            let hasOnnx = false;
+            let hasTokens = false;
+            while ((info = enumerator.next_file(null))) {
+                const name = info.get_name();
+                if (name.endsWith('.onnx')) {
+                    hasOnnx = true;
+                }
+                if (name === 'tokens.txt') {
+                    hasTokens = true;
                 }
             }
-            
-            // Fallback: check directory for installed models
-            const dir = Gio.File.new_for_path(this._modelDir);
-            if (!dir.query_exists(null)) {
-                return null;
-            }
-
-            const enumerator = dir.enumerate_children(
-                'standard::name',
-                Gio.FileQueryInfoFlags.NONE,
-                null
-            );
-
-            let fileInfo;
-            // Prefer tiny.en as default
-            while ((fileInfo = enumerator.next_file(null))) {
-                const name = fileInfo.get_name();
-                if (name === 'ggml-tiny.en.bin') {
-                    return name;
-                }
-            }
-
-            // If tiny.en not found, return first .bin file
             enumerator.close(null);
-            const enumerator2 = dir.enumerate_children(
-                'standard::name',
-                Gio.FileQueryInfoFlags.NONE,
-                null
-            );
-
-            while ((fileInfo = enumerator2.next_file(null))) {
-                const name = fileInfo.get_name();
-                if (name.endsWith('.bin') && name.startsWith('ggml-')) {
-                    return name;
-                }
-            }
+            return hasOnnx && (hasTokens || dirPath.endsWith('/speaker'));
         } catch (e) {
-            console.error('Error getting current model:', e);
-        }
-
-        return null;
-    }
-
-    /**
-     * Get model file size
-     */
-    _getModelSize(filename) {
-        try {
-            const file = Gio.File.new_for_path(`${this._modelDir}/${filename}`);
-            if (!file.query_exists(null)) {
-                return null;
-            }
-
-            const info = file.query_info(
-                'standard::size',
-                Gio.FileQueryInfoFlags.NONE,
-                null
-            );
-
-            const bytes = info.get_size();
-            const mb = (bytes / (1024 * 1024)).toFixed(0);
-            return `${mb} MB`;
-        } catch (e) {
-            return null;
+            return false;
         }
     }
 
-    /**
-     * Download a model
-     */
-    _downloadModel(model, window, button, refreshCallback) {
+    _allInstalled() {
+        return this._bundles.every(bundle => bundle.check());
+    }
+
+    _refreshUI() {
+        if (!this._statusRow) {
+            return;
+        }
+
+        const installed = this._bundles.filter(b => b.check()).length;
+        const total = this._bundles.length;
+        const allReady = installed === total;
+
+        this._statusRow.subtitle = allReady
+            ? 'All models installed and ready'
+            : `${installed}/${total} model bundles installed`;
+
+        for (const bundle of this._bundles) {
+            const row = this._bundleRows.get(bundle.id);
+            if (!row) {
+                continue;
+            }
+            const ready = bundle.check();
+            row.subtitle = ready
+                ? `✓ Installed • ${bundle.description}`
+                : `Missing • ${bundle.description} • ${bundle.size}`;
+        }
+    }
+
+    _downloadAll(window, button) {
         if (this._downloadInProgress) {
             this._showToast(window, 'Download already in progress');
             return;
@@ -368,171 +162,42 @@ export class WhisperModelManager {
 
         this._downloadInProgress = true;
         button.sensitive = false;
-        button.label = 'Downloading...';
+        button.label = 'Downloading…';
+        this._showToast(window, 'Downloading sherpa-onnx models…');
 
-        // Ensure model directory exists
-        GLib.spawn_command_line_sync(`mkdir -p ${this._modelDir}`);
-
-        const outputPath = `${this._modelDir}/${model.file}`;
-        const tempPath = `${outputPath}.tmp`;
-        const command = `wget -O "${tempPath}" "${model.url}" && mv "${tempPath}" "${outputPath}"`;
-
-        this._showToast(window, `Downloading ${model.name} model (${model.size})...`);
-
-        // Monitor download completion
-        const checkCompletion = () => {
-            const file = Gio.File.new_for_path(outputPath);
-            const tempFile = Gio.File.new_for_path(tempPath);
-            
-            // Check if download completed
-            if (file.query_exists(null)) {
-                this._downloadInProgress = false;
-                button.sensitive = true;
-                button.label = 'Download';
-                this._showToast(window, `${model.name} downloaded successfully`);
-                
-                // Refresh UI to show new model
-                if (refreshCallback) {
-                    refreshCallback();
-                }
-                
-                return GLib.SOURCE_REMOVE;
-            }
-            
-            // Check if download failed (temp file gone but no final file)
-            if (!tempFile.query_exists(null) && !file.query_exists(null)) {
-                this._downloadInProgress = false;
-                button.sensitive = true;
-                button.label = 'Download';
-                this._showToast(window, `Download failed for ${model.name}`);
-                return GLib.SOURCE_REMOVE;
-            }
-            
-            // Update progress by checking temp file size
-            if (tempFile.query_exists(null)) {
-                try {
-                    const info = tempFile.query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null);
-                    const bytes = info.get_size();
-                    const mb = (bytes / (1024 * 1024)).toFixed(0);
-                    button.label = `${mb} MB...`;
-                } catch (e) {
-                    // Ignore errors during progress check
-                }
-            }
-            
-            return GLib.SOURCE_CONTINUE;
-        };
-
-        // Run download in background
+        const command = 'willow-download-model';
         try {
-            GLib.spawn_command_line_async(`sh -c '${command} && notify-send "Willow" "Model ${model.name} downloaded successfully"'`);
-            
-            // Poll for completion every second for better responsiveness
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, checkCompletion);
+            GLib.spawn_command_line_async(command);
         } catch (e) {
-            console.error('Download error:', e);
             this._downloadInProgress = false;
             button.sensitive = true;
             button.label = 'Download';
             this._showToast(window, `Download failed: ${e.message}`);
+            return;
         }
-    }
 
-    /**
-     * Select a model (save to config and restart service)
-     */
-    _selectModel(model, window, onComplete) {
-        try {
-            // Load current config
-            const configPath = GLib.get_home_dir() + '/.config/willow/config.json';
-            const configFile = Gio.File.new_for_path(configPath);
-            
-            if (!configFile.query_exists(null)) {
-                this._showToast(window, 'Configuration file not found. Please start the service first.');
-                return;
-            }
-            
-            let [success, contents] = configFile.load_contents(null);
-            if (!success) {
-                this._showToast(window, 'Failed to read configuration file');
-                return;
-            }
-            
-            let config = JSON.parse(new TextDecoder().decode(contents));
-            
-            // Update the whisper_model field
-            config.whisper_model = model.file;
-            
-            // Save back to file
-            const configJson = JSON.stringify(config, null, 2);
-            configFile.replace_contents(
-                configJson,
-                null,
-                false,
-                Gio.FileCreateFlags.REPLACE_DESTINATION,
-                null
-            );
-            
-            this._showToast(window, `Selected ${model.name}. Restarting service...`);
-            
-            // Restart the service to apply the change
-            GLib.spawn_command_line_async('systemctl --user restart willow.service');
-            
-            // Refresh UI after a brief delay to allow config file to be written
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                if (onComplete) {
-                    onComplete();
-                }
+        const poll = () => {
+            this._refreshUI();
+            if (this._allInstalled()) {
+                this._downloadInProgress = false;
+                button.sensitive = true;
+                button.label = 'Download';
+                this._showToast(window, 'All models installed');
                 return GLib.SOURCE_REMOVE;
-            });
-            
-            // Show notification after a delay
-            GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
-                this._showToast(window, `Now using ${model.name} model`);
-                return GLib.SOURCE_REMOVE;
-            });
-            
-        } catch (e) {
-            console.error('Failed to select model:', e);
-            this._showToast(window, `Failed to select model: ${e.message}`);
-        }
-    }
-
-    /**
-     * Delete a model
-     */
-    _deleteModel(model, window, refreshCallback) {
-        const dialog = new Gtk.MessageDialog({
-            modal: true,
-            transient_for: window,
-            message_type: Gtk.MessageType.QUESTION,
-            buttons: Gtk.ButtonsType.YES_NO,
-            text: `Delete ${model.name} model?`,
-            secondary_text: `This will permanently delete the model file (${model.size}). This action cannot be undone.`,
-        });
-
-        dialog.connect('response', (dialog, response) => {
-            if (response === Gtk.ResponseType.YES) {
-                try {
-                    const file = Gio.File.new_for_path(`${this._modelDir}/${model.file}`);
-                    file.delete(null);
-                    this._showToast(window, `${model.name} deleted`);
-                    if (refreshCallback) {
-                        refreshCallback();
-                    }
-                } catch (e) {
-                    this._showToast(window, `Failed to delete model: ${e.message}`);
-                }
             }
-            dialog.close();
-        });
+            return GLib.SOURCE_CONTINUE;
+        };
 
-        dialog.present();
+        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, poll);
+        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 120, () => {
+            this._downloadInProgress = false;
+            button.sensitive = true;
+            button.label = 'Download';
+            this._refreshUI();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
-    /**
-     * Open model directory
-     */
     _openModelDirectory() {
         try {
             GLib.spawn_command_line_sync(`mkdir -p ${this._modelDir}`);
@@ -542,17 +207,10 @@ export class WhisperModelManager {
         }
     }
 
-    /**
-     * Show toast notification
-     */
     _showToast(window, message) {
-        console.log(`WhisperModelManager: ${message}`);
+        console.log(`SpeechModelManager: ${message}`);
         try {
-            const toast = new Adw.Toast({
-                title: message,
-                timeout: 3,
-            });
-            window.add_toast(toast);
+            window.add_toast(new Adw.Toast({title: message, timeout: 3}));
         } catch (e) {
             console.log(`Toast: ${message}`);
         }

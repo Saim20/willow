@@ -35,6 +35,7 @@ public:
     // Smart workflows
     bool executeSmartOpen(const std::string& appName);
     bool executeSmartSearch(const std::string& engine, const std::string& query);
+    bool openUrl(const std::string& url);
     
     // Keyboard simulation via ydotool
     void typeText(const std::string& text);
@@ -51,6 +52,7 @@ public:
     
     // Context configuration
     void loadContextConfig(const std::string& contextPath);
+    void applyDefaultContext();
     const ContextConfig& getContextConfig() const { return m_context; }
     
     // Logging
@@ -60,6 +62,7 @@ private:
     std::string m_logFile;
     mutable std::mutex m_logMutex;
     ContextConfig m_context;
+    bool m_ydotoolAvailable;
     
     // Helper for command execution
     bool executeSystemCommand(const std::string& command);

@@ -16,20 +16,15 @@ void signalHandler(int signal) {
 }
 
 int main(int /*argc*/, char* /*argv*/[]) {
-    // Set up signal handlers
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
 
     try {
         std::cout << "Starting Voice Assistant Service..." << std::endl;
 
-        // Create D-Bus connection
         auto connection = sdbus::createSessionBusConnection();
-        
-        // Request D-Bus name
         connection->requestName(sdbus::ServiceName{"com.github.saim.Willow"});
         
-        // Create service object
         const std::string objectPath = "/com/github/saim/VoiceAssistant";
         VoiceAssistant::VoiceAssistantService service(*connection, objectPath);
 
@@ -38,11 +33,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
         std::cout << "Object path: " << objectPath << std::endl;
         std::cout << "Press Ctrl+C to exit" << std::endl;
 
-        // Run the event loop
+        connection->enterEventLoopAsync();
+
         while (!g_exitRequested) {
-            connection->processPendingEvent();
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
+        connection->leaveEventLoop();
 
         std::cout << "Service stopped successfully" << std::endl;
         return 0;

@@ -2,8 +2,9 @@
   "uuid": "willow@saim",
   "name": "Willow",
   "description": "Simple offline configurable voice assistant for gnome",
-  "version": "2.0",
+  "version": "3.0",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/Saim20/willow",
-  "settings-schema": "org.gnome.shell.extensions.willow"
+  "settings-schema": "org.gnome.shell.extensions.willow",
+  "stylesheet": "stylesheet.css"
 }

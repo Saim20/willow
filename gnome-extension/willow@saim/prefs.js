@@ -26,7 +26,7 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         this._commandManager = new CommandManager(this._configManager);
         this._prefsBuilder = new PreferencesBuilder(settings);
         this._statusManager = new StatusManager();
-        this._modelManager = new WhisperModelManager();
+        this._modelManager = new WhisperModelManager(this._configManager);
         this._logViewer = new LogViewer();
         
         // Setup automatic sync with debouncing
@@ -44,6 +44,7 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         
         // Create pages
         this._createGeneralPage(window, settings);
+        this._createVoicePage(window, settings);
         this._createModelsPage(window, settings);
         this._createCommandsPage(window, settings);
         this._createLogsPage(window, settings);
@@ -66,7 +67,7 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             'Activation Hotword',
             'Word used to activate command mode from normal mode',
             'hotword',
-            'hey',
+            'hey willow',
             recognitionGroup
         );
 
@@ -75,21 +76,6 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             'Minimum confidence percentage to execute commands (50-100%)',
             'command-threshold',
             50, 100, 5,
-            recognitionGroup
-        );
-
-        this._prefsBuilder.createDoubleSpinButtonRow(
-            'Processing Interval',
-            'Time to wait before processing speech (0.5-5.0 seconds)',
-            'processing-interval',
-            0.5, 5.0, 0.1, 1,
-            recognitionGroup
-        );
-
-        this._prefsBuilder.createSwitchRow(
-            'GPU Acceleration',
-            'Enable GPU acceleration for whisper.cpp (requires GPU support and service restart)',
-            'gpu-acceleration',
             recognitionGroup
         );
 
@@ -135,8 +121,15 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             'Load from Service',
             'document-open-symbolic',
             () => {
-                this._configManager.syncConfigToSettings();
-                this._showToast(window, 'Configuration loaded from service');
+                this._configManager.loadConfigFromService((config, error) => {
+                    if (error) {
+                        this._showToast(window, 'Failed to load config from service');
+                        console.error('Failed to load config from service:', error);
+                        return;
+                    }
+                    this._configManager.syncConfigToSettings();
+                    this._showToast(window, 'Configuration loaded from service');
+                });
             },
             serviceGroup
         );
@@ -214,6 +207,143 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         window.add(page);
     }
 
+    _createVoicePage(window, settings) {
+        const page = new Adw.PreferencesPage({
+            title: 'Voice',
+            icon_name: 'audio-input-microphone-symbolic',
+        });
+
+        const verifyGroup = this._prefsBuilder.createGroup(
+            'Speaker Verification',
+            'Enroll your voice so only you can activate Willow after the hotword'
+        );
+
+        this._enrollStatusRow = this._prefsBuilder.createInfoRow(
+            'Enrollment Status',
+            'Checking…',
+            verifyGroup
+        );
+
+        this._prefsBuilder.createInfoRow(
+            'How it works',
+            'After saying the hotword, Willow compares your voice to the enrolled profile. Speak naturally during enrollment — 3 short samples are collected automatically.',
+            verifyGroup
+        );
+
+        this._prefsBuilder.createButtonRow(
+            'Start Enrollment',
+            'Record voice samples while the service is running',
+            'Start',
+            'microphone-sensitivity-high-symbolic',
+            () => this._startSpeakerEnrollment(window),
+            verifyGroup
+        );
+
+        this._prefsBuilder.createButtonRow(
+            'Cancel Enrollment',
+            'Stop an in-progress enrollment session',
+            'Cancel',
+            'process-stop-symbolic',
+            () => this._cancelSpeakerEnrollment(window),
+            verifyGroup
+        );
+
+        this._prefsBuilder.createButtonRow(
+            'Remove Voice Profile',
+            'Delete enrolled speaker data and disable verification',
+            'Remove Profile',
+            'user-trash-symbolic',
+            () => this._removeSpeakerProfile(window),
+            verifyGroup
+        );
+
+        page.add(verifyGroup);
+        window.add(page);
+
+        this._enrollPollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+            this._refreshEnrollmentStatus();
+            return GLib.SOURCE_CONTINUE;
+        });
+        this._refreshEnrollmentStatus();
+    }
+
+    _getProxy() {
+        return this._configManager?._proxy ?? null;
+    }
+
+    _refreshEnrollmentStatus() {
+        const proxy = this._getProxy();
+        if (!proxy || !this._enrollStatusRow) {
+            return;
+        }
+
+        try {
+            proxy.GetSpeakerEnrollmentStatusRemote((result, error) => {
+                if (error || !result || !result[0]) {
+                    this._enrollStatusRow.subtitle = 'Service not connected';
+                    return;
+                }
+                const status = result[0];
+                const state = status.state?.unpack?.() ?? 'idle';
+                const samples = status.samples?.unpack?.() ?? 0;
+                const enrolled = status.enrolled?.unpack?.() ?? false;
+
+                if (enrolled) {
+                    this._enrollStatusRow.subtitle = 'Voice profile enrolled';
+                } else if (state === 'recording') {
+                    this._enrollStatusRow.subtitle = `Recording sample ${samples}/3 — keep speaking naturally`;
+                } else if (state === 'complete') {
+                    this._enrollStatusRow.subtitle = 'Enrollment complete';
+                } else if (state === 'failed') {
+                    this._enrollStatusRow.subtitle = 'Enrollment failed — try again';
+                } else {
+                    this._enrollStatusRow.subtitle = 'Not enrolled';
+                }
+            });
+        } catch (e) {
+            this._enrollStatusRow.subtitle = 'Service not available';
+        }
+    }
+
+    _startSpeakerEnrollment(window) {
+        const proxy = this._getProxy();
+        if (!proxy) {
+            this._showToast(window, 'Willow service not connected');
+            return;
+        }
+        proxy.StartSpeakerEnrollmentRemote((result, error) => {
+            if (error) {
+                this._showToast(window, `Enrollment failed: ${error}`);
+                return;
+            }
+            this._showToast(window, 'Enrollment started — speak for a few seconds');
+            this._refreshEnrollmentStatus();
+        });
+    }
+
+    _cancelSpeakerEnrollment(window) {
+        const proxy = this._getProxy();
+        if (!proxy) {
+            return;
+        }
+        proxy.CancelSpeakerEnrollmentRemote(() => {
+            this._showToast(window, 'Enrollment cancelled');
+            this._refreshEnrollmentStatus();
+        });
+    }
+
+    _removeSpeakerProfile(window) {
+        const proxy = this._getProxy();
+        if (!proxy) {
+            this._showToast(window, 'Willow service not connected');
+            return;
+        }
+        proxy.RemoveSpeakerProfileRemote(() => {
+            this._showToast(window, 'Voice profile removed');
+            this._refreshEnrollmentStatus();
+        });
+    }
+
     _createLogsPage(window, settings) {
         const page = new Adw.PreferencesPage({
             title: 'Logs',
@@ -266,24 +396,24 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         // Model information group
         const infoGroup = this._prefsBuilder.createGroup(
             'Model Information',
-            'Understanding whisper.cpp models for speech recognition'
+            'Understanding sherpa-onnx models for Willow speech pipeline'
         );
 
         this._prefsBuilder.createInfoRow(
-            'Model Selection',
-            'The C++ service automatically uses models from the model directory. Restart the service after downloading new models.',
+            'Model Bundles',
+            'KWS handles hotword detection in normal mode. Streaming ASR powers command and typing modes. Speaker model enables voice verification.',
             infoGroup
         );
 
         this._prefsBuilder.createInfoRow(
-            'Recommended Models',
-            'tiny.en: Best balance of speed and accuracy for English • base.en: Better accuracy, slower • small.en: High accuracy, requires more resources',
+            'Download',
+            'Run willow-download-model or use the Download button above. Restart the service after installing models.',
             infoGroup
         );
 
         this._prefsBuilder.createInfoRow(
             'Model Source',
-            'Models are downloaded from Hugging Face (ggerganov/whisper.cpp repository)',
+            'Models are downloaded from the sherpa-onnx GitHub releases (k2-fsa/sherpa-onnx)',
             infoGroup
         );
 
@@ -398,25 +528,25 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
         // Info group
         const infoGroup = this._prefsBuilder.createGroup(
-            'Willow with Whisper.cpp',
-            'Modern D-Bus-based voice control system for GNOME with offline speech recognition'
+            'Willow Voice Assistant',
+            'Offline voice control for GNOME using sherpa-onnx'
         );
 
         this._prefsBuilder.createInfoRow(
             'Features',
-            'Offline whisper.cpp recognition • D-Bus integration • Real-time mode display • Wayland ydotool support',
+            'Offline sherpa-onnx speech pipeline • Speaker verification • Real-time typing • D-Bus integration • Wayland ydotool support',
             infoGroup
         );
 
         this._prefsBuilder.createInfoRow(
             'Technology',
-            'C++ D-Bus service • Whisper tiny.en model • Configurable confidence thresholds • PulseAudio/PipeWire capture',
+            'Sherpa-onnx speech pipeline • Speaker verification • D-Bus service • Wayland ydotool support',
             infoGroup
         );
 
         this._prefsBuilder.createInfoRow(
             'Usage',
-            'Say "hey" to activate • Speak commands • Extension shows live recognition buffer',
+            'Say "hey willow" to activate • Streaming partial text in panel • Enroll voice in Voice tab',
             infoGroup
         );
 

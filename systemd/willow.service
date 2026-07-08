@@ -1,7 +1,9 @@
 [Unit]
 Description=Willow Voice Assistant Service
 Documentation=https://github.com/saim/willow
-After=graphical-session.target
+After=graphical-session.target pipewire.service pipewire-pulse.service sound-server.target
+Wants=pipewire-pulse.service sound-server.target
+PartOf=graphical-session.target
 
 [Service]
 Type=dbus
@@ -10,20 +12,19 @@ ExecStart=/usr/bin/willow-service
 Restart=on-failure
 RestartSec=5
 
-# Environment
-Environment="PATH=/usr/bin"
-Environment="DISPLAY=:0"
-Environment="WAYLAND_DISPLAY=wayland-0"
-Environment="XDG_RUNTIME_DIR=/run/user/%U"
-Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
-Environment="XDG_SESSION_TYPE=wayland"
+Environment=PATH=/usr/bin:/usr/local/bin
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+# Import graphical session environment for xdg-open / browser launch
+ExecStartPre=/bin/sh -c 'for var in WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP; do eval val=$(tr "\\0" "\\n" < /proc/$(pgrep -u %U -n gnome-shell 2>/dev/null || echo 0)/environ 2>/dev/null | grep "^$var=" | cut -d= -f2-); [ -n "$val" ] && systemctl --user set-environment $var="$val"; done; exit 0'
 
 # Security - Relaxed for GUI app launching
 PrivateTmp=false
 NoNewPrivileges=false
 
-# Allow access to config and model directories
-ReadWritePaths=%h/.config/willow
+# Auto-create ~/.config/willow on first start (ReadWritePaths fails if missing)
+ConfigurationDirectory=willow
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

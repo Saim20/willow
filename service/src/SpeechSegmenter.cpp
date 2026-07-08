@@ -11,23 +11,56 @@ namespace VoiceAssistant {
 
 SpeechSegmenter::SpeechSegmenter()
     : m_whisperCtx(nullptr)
-    , m_vadThreshold(0.0003f)       // More sensitive threshold for normal speech
-    , m_silenceDuration(0.8f)        // 800ms of silence ends segment
-    , m_minSpeechDuration(0.25f)     // Minimum 250ms of speech
+    , m_vadThreshold(0.0003f)
+    , m_silenceDuration(0.8f)
+    , m_minSpeechDuration(0.25f)
+    , m_energyFilterEnabled(false)
+    , m_minPeakEnergy(0.001f)
     , m_isSpeaking(false)
+    , m_segmentPeakEnergy(0.0f)
     , m_silenceFrames(0)
     , m_speechFrames(0)
 {
+    m_frameBuffer.resize(FRAME_SIZE);
 }
 
 SpeechSegmenter::~SpeechSegmenter() {
     shutdown();
 }
 
+void SpeechSegmenter::setVADThreshold(float threshold) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    m_vadThreshold = threshold;
+}
+
+void SpeechSegmenter::setSilenceDuration(float seconds) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    m_silenceDuration = seconds;
+}
+
+void SpeechSegmenter::setMinSpeechDuration(float seconds) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    m_minSpeechDuration = seconds;
+}
+
+void SpeechSegmenter::setThreadCount(int threads) {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    if (threads > 0) {
+        m_whisperParams.n_threads = threads;
+    }
+}
+
+void SpeechSegmenter::setEnergyFilterEnabled(bool enabled) {
+    m_energyFilterEnabled = enabled;
+}
+
+void SpeechSegmenter::setMinPeakEnergy(float energy) {
+    m_minPeakEnergy = energy;
+}
+
 bool SpeechSegmenter::initialize(const std::string& modelPath, const std::string& modelFile, bool useGPU) {
     m_modelPath = modelPath + "/" + modelFile;
     
-    // Initialize whisper context with GPU support
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = useGPU;
     cparams.gpu_device = 0;
@@ -42,7 +75,6 @@ bool SpeechSegmenter::initialize(const std::string& modelPath, const std::string
         return false;
     }
     
-    // Setup whisper parameters for fast inference
     m_whisperParams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     m_whisperParams.print_progress = false;
     m_whisperParams.print_timestamps = false;
@@ -50,14 +82,19 @@ bool SpeechSegmenter::initialize(const std::string& modelPath, const std::string
     m_whisperParams.language = "en";
     m_whisperParams.n_threads = 4;
     m_whisperParams.translate = false;
-    m_whisperParams.no_context = true;  // Don't use context from previous segments
+    m_whisperParams.no_context = true;
     m_whisperParams.single_segment = false;
+    
+    startInferenceThread();
+    warmupModel();
     
     log("INFO", "Whisper initialized successfully");
     return true;
 }
 
 void SpeechSegmenter::shutdown() {
+    stopInferenceThread();
+    
     if (m_whisperCtx) {
         whisper_free(m_whisperCtx);
         m_whisperCtx = nullptr;
@@ -65,64 +102,127 @@ void SpeechSegmenter::shutdown() {
     }
 }
 
+void SpeechSegmenter::startInferenceThread() {
+    m_stopInference = false;
+    m_inferenceThread = std::thread(&SpeechSegmenter::inferenceLoop, this);
+}
+
+void SpeechSegmenter::stopInferenceThread() {
+    m_stopInference = true;
+    m_queueCv.notify_all();
+    
+    if (m_inferenceThread.joinable()) {
+        m_inferenceThread.join();
+    }
+    
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    while (!m_segmentQueue.empty()) {
+        m_segmentQueue.pop();
+    }
+}
+
+void SpeechSegmenter::enqueueSegment(SpeechSegment segment) {
+    if (m_energyFilterEnabled && segment.peakEnergy < m_minPeakEnergy) {
+        log("INFO", "Skipping low-energy segment (peak: " + std::to_string(segment.peakEnergy) + ")");
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    while (m_segmentQueue.size() >= MAX_QUEUE_DEPTH) {
+        m_segmentQueue.pop();
+        log("WARNING", "Inference queue full, dropping oldest segment");
+    }
+    m_segmentQueue.push(std::move(segment));
+    m_queueCv.notify_one();
+}
+
+void SpeechSegmenter::inferenceLoop() {
+    while (!m_stopInference) {
+        SpeechSegment segment;
+        
+        {
+            std::unique_lock<std::mutex> lock(m_queueMutex);
+            m_queueCv.wait(lock, [this]() {
+                return m_stopInference || !m_segmentQueue.empty();
+            });
+            
+            if (m_stopInference) {
+                break;
+            }
+            
+            segment = std::move(m_segmentQueue.front());
+            m_segmentQueue.pop();
+        }
+        
+        std::string transcription = transcribe(segment.samples);
+        if (!transcription.empty()) {
+            log("INFO", "Transcription: " + transcription);
+            
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            if (m_callback) {
+                m_callback(transcription);
+            }
+        }
+    }
+}
+
 void SpeechSegmenter::processAudioChunk(const std::vector<float>& chunk) {
     if (!m_whisperCtx) return;
     
-    // Process in frames for VAD
+    float vadThreshold;
+    float silenceDuration;
+    float minSpeechDuration;
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        vadThreshold = m_vadThreshold;
+        silenceDuration = m_silenceDuration;
+        minSpeechDuration = m_minSpeechDuration;
+    }
+    
     for (size_t i = 0; i + FRAME_SIZE <= chunk.size(); i += FRAME_SIZE) {
-        std::vector<float> frame(chunk.begin() + i, chunk.begin() + i + FRAME_SIZE);
+        std::copy(chunk.begin() + i, chunk.begin() + i + FRAME_SIZE, m_frameBuffer.begin());
         
-        bool voiceDetected = detectVoiceActivity(frame);
+        float energy = calculateEnergy(m_frameBuffer);
+        bool voiceDetected = energy > vadThreshold;
         
         if (voiceDetected) {
-            // Voice detected - accumulate speech
             if (!m_isSpeaking) {
                 log("INFO", "Speech started");
                 m_isSpeaking = true;
                 m_speechBuffer.clear();
+                m_segmentPeakEnergy = 0.0f;
             }
             
-            m_speechBuffer.insert(m_speechBuffer.end(), frame.begin(), frame.end());
+            m_segmentPeakEnergy = std::max(m_segmentPeakEnergy, energy);
+            m_speechBuffer.insert(m_speechBuffer.end(), m_frameBuffer.begin(), m_frameBuffer.end());
             m_silenceFrames = 0;
             m_speechFrames++;
             
         } else if (m_isSpeaking) {
-            // In speech but current frame is silent
-            m_speechBuffer.insert(m_speechBuffer.end(), frame.begin(), frame.end());
+            m_speechBuffer.insert(m_speechBuffer.end(), m_frameBuffer.begin(), m_frameBuffer.end());
             m_silenceFrames++;
             
-            // Check if we've had enough silence to end the segment
-            int silenceThresholdFrames = static_cast<int>(m_silenceDuration * FRAMES_PER_SECOND);
+            int silenceThresholdFrames = static_cast<int>(silenceDuration * FRAMES_PER_SECOND);
             if (m_silenceFrames >= silenceThresholdFrames) {
-                // End of speech segment
                 float speechDuration = static_cast<float>(m_speechFrames) / FRAMES_PER_SECOND;
                 
                 log("INFO", "Speech ended (duration: " + std::to_string(speechDuration) + "s)");
                 
-                // Only transcribe if speech was long enough
-                if (speechDuration >= m_minSpeechDuration) {
-                    // Transcribe the complete segment
-                    std::string transcription = transcribe(m_speechBuffer);
-                    
-                    if (!transcription.empty()) {
-                        log("INFO", "Transcription: " + transcription);
-                        
-                        // Call the callback
-                        std::lock_guard<std::mutex> lock(m_callbackMutex);
-                        if (m_callback) {
-                            m_callback(transcription);
-                        }
-                    }
+                if (speechDuration >= minSpeechDuration) {
+                    SpeechSegment segment;
+                    segment.samples = std::move(m_speechBuffer);
+                    segment.peakEnergy = m_segmentPeakEnergy;
+                    enqueueSegment(std::move(segment));
                 } else {
                     log("INFO", "Speech too short, ignoring (duration: " + 
                         std::to_string(speechDuration) + "s)");
                 }
                 
-                // Reset state
                 m_isSpeaking = false;
                 m_speechBuffer.clear();
                 m_silenceFrames = 0;
                 m_speechFrames = 0;
+                m_segmentPeakEnergy = 0.0f;
             }
         }
     }
@@ -135,6 +235,7 @@ void SpeechSegmenter::setTranscriptionCallback(TranscriptionCallback callback) {
 
 bool SpeechSegmenter::detectVoiceActivity(const std::vector<float>& frame) {
     float energy = calculateEnergy(frame);
+    std::lock_guard<std::mutex> lock(m_configMutex);
     return energy > m_vadThreshold;
 }
 
@@ -154,13 +255,11 @@ std::string SpeechSegmenter::transcribe(const std::vector<float>& samples) {
         return "";
     }
     
-    // Run whisper inference
     if (whisper_full(m_whisperCtx, m_whisperParams, samples.data(), samples.size()) != 0) {
         log("ERROR", "Whisper transcription failed");
         return "";
     }
     
-    // Get transcription result
     const int n_segments = whisper_full_n_segments(m_whisperCtx);
     std::string result;
     
@@ -171,33 +270,32 @@ std::string SpeechSegmenter::transcribe(const std::vector<float>& samples) {
         }
     }
     
-    // Clean the transcription
-    result = cleanTranscription(result);
+    return cleanTranscription(result);
+}
+
+void SpeechSegmenter::warmupModel() {
+    if (!m_whisperCtx) return;
     
-    return result;
+    std::vector<float> silence(FRAME_SIZE, 0.0f);
+    whisper_full(m_whisperCtx, m_whisperParams, silence.data(), silence.size());
+    log("INFO", "Whisper model warmed up");
 }
 
 std::string SpeechSegmenter::cleanTranscription(const std::string& text) {
     std::string result = text;
     
-    // Remove content inside brackets [], braces {}, and parentheses ()
-    // This handles [BLANK_AUDIO], [MUSIC], etc.
     std::regex bracketPattern(R"(\[[^\]]*\]|\{[^\}]*\}|\([^\)]*\))");
     result = std::regex_replace(result, bracketPattern, "");
     
-    // Remove punctuation (periods, commas, exclamation marks, question marks, etc.)
     std::regex punctPattern(R"([.,!?;:])");
     result = std::regex_replace(result, punctPattern, "");
     
-    // Collapse multiple spaces into single space
     std::regex multiSpacePattern(R"(\s+)");
     result = std::regex_replace(result, multiSpacePattern, " ");
     
-    // Trim whitespace
     result.erase(0, result.find_first_not_of(" \t\n\r"));
     result.erase(result.find_last_not_of(" \t\n\r") + 1);
     
-    // Convert to lowercase for processing
     std::transform(result.begin(), result.end(), result.begin(), ::tolower);
     
     return result;

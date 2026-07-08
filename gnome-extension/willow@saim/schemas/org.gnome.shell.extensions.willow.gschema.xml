@@ -20,7 +20,7 @@
       <description>Time in seconds to wait before processing buffered speech</description>
     </key>
     <key name="hotword" type="s">
-      <default>'hey'</default>
+      <default>'hey willow'</default>
       <summary>Activation hotword</summary>
       <description>The word used to activate command mode from normal mode</description>
     </key>

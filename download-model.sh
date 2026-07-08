@@ -1,98 +1,92 @@
 #!/bin/bash
-# Helper script to download whisper models for Willow
+# Download sherpa-onnx speech models for Willow
 
-set -e
+set -euo pipefail
 
-MODEL_DIR="$HOME/.local/share/willow/models"
-WHISPER_REPO="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+MODEL_DIR="${HOME}/.local/share/willow/models"
+BASE_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
-echo "==================================================================="
-echo "Willow - Whisper Model Downloader"
-echo "==================================================================="
-echo ""
-echo "Available models:"
-echo "  1) tiny.en    (~75MB)  - Fastest, good for commands (recommended)"
-echo "  2) base.en    (~142MB) - Better accuracy, still fast"
-echo "  3) small.en   (~466MB) - High accuracy, moderate speed"
-echo "  4) medium.en  (~1.5GB) - Best accuracy, slower"
-echo ""
+download_tar() {
+    local url="$1"
+    local dest_name="$2"
+    local dest="${MODEL_DIR}/${dest_name}"
 
-# Check if model already exists
-if [ -f "$MODEL_DIR/ggml-tiny.en.bin" ]; then
-    echo "Note: tiny.en model already exists at:"
-    echo "  $MODEL_DIR/ggml-tiny.en.bin"
-    echo ""
-fi
-
-read -p "Select model to download [1-4, default: 1]: " choice
-choice=${choice:-1}
-
-case $choice in
-    1)
-        MODEL="tiny.en"
-        SIZE="75MB"
-        ;;
-    2)
-        MODEL="base.en"
-        SIZE="142MB"
-        ;;
-    3)
-        MODEL="small.en"
-        SIZE="466MB"
-        ;;
-    4)
-        MODEL="medium.en"
-        SIZE="1.5GB"
-        ;;
-    *)
-        echo "Invalid choice. Defaulting to tiny.en"
-        MODEL="tiny.en"
-        SIZE="75MB"
-        ;;
-esac
-
-MODEL_FILE="ggml-$MODEL.bin"
-MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
-
-echo ""
-echo "Downloading: $MODEL ($SIZE)"
-echo "Destination: $MODEL_PATH"
-echo ""
-
-# Create directory
-mkdir -p "$MODEL_DIR"
-
-# Download with progress
-if command -v curl &> /dev/null; then
-    curl -L --progress-bar "$WHISPER_REPO/$MODEL_FILE" -o "$MODEL_PATH"
-elif command -v wget &> /dev/null; then
-    wget --show-progress "$WHISPER_REPO/$MODEL_FILE" -O "$MODEL_PATH"
-else
-    echo "ERROR: Neither curl nor wget found. Please install one of them."
-    exit 1
-fi
-
-echo ""
-echo "==================================================================="
-echo "Download complete!"
-echo ""
-echo "Model saved to: $MODEL_PATH"
-echo ""
-
-# If not tiny.en, update config
-if [ "$MODEL" != "tiny.en" ]; then
-    CONFIG_FILE="$HOME/.config/willow/config.json"
-    if [ -f "$CONFIG_FILE" ]; then
-        echo "To use this model, update your config:"
-        echo "  1. Open: gnome-extensions prefs willow@saim"
-        echo "  2. Go to 'General' tab"
-        echo "  3. Change 'Whisper Model' to: $MODEL_FILE"
-        echo ""
-        echo "Or manually edit: $CONFIG_FILE"
-        echo "  Change 'model_path' to: $MODEL_PATH"
+    if [ -d "${dest}" ] && ls "${dest}"/*.onnx &>/dev/null 2>&1 && [ -f "${dest}/tokens.txt" ]; then
+        echo "✓ ${dest_name} already present"
+        return 0
     fi
+
+    echo "Downloading ${dest_name}..."
+    mkdir -p "${MODEL_DIR}"
+    local archive="${MODEL_DIR}/$(basename "${url}")"
+    if command -v curl &>/dev/null; then
+        curl -L --progress-bar "${url}" -o "${archive}"
+    else
+        wget --show-progress "${url}" -O "${archive}"
+    fi
+
+    tar -xjf "${archive}" -C "${MODEL_DIR}"
+    local extracted
+    extracted=$(tar -tjf "${archive}" | head -1 | cut -d/ -f1)
+    rm -f "${archive}"
+
+    if [ -n "${extracted}" ] && [ -d "${MODEL_DIR}/${extracted}" ]; then
+        rm -rf "${dest}"
+        mv "${MODEL_DIR}/${extracted}" "${dest}"
+    fi
+
+    echo "✓ ${dest_name} installed to ${dest}"
+}
+
+echo "==================================================================="
+echo "Willow - Sherpa-onnx Model Downloader"
+echo "==================================================================="
+echo "Installing models to: ${MODEL_DIR}"
+echo ""
+
+download_tar \
+    "${BASE_URL}/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2" \
+    "kws"
+
+download_tar \
+    "${BASE_URL}/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2" \
+    "streaming"
+
+mkdir -p "${MODEL_DIR}/speaker"
+if [ ! -f "${MODEL_DIR}/speaker/model.onnx" ]; then
+    echo "Downloading speaker model..."
+    SPEAKER_URL="${BASE_URL}/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+    if command -v curl &>/dev/null; then
+        curl -L --progress-bar "${SPEAKER_URL}" -o "${MODEL_DIR}/speaker/model.onnx"
+    else
+        wget --show-progress "${SPEAKER_URL}" -O "${MODEL_DIR}/speaker/model.onnx"
+    fi
+    echo "✓ speaker installed"
+else
+    echo "✓ speaker already present"
 fi
 
-echo "Restart the service to use the new model:"
-echo "  systemctl --user restart willow.service"
+mkdir -p "${MODEL_DIR}/kws"
+if [ ! -f "${MODEL_DIR}/kws/keywords.txt" ]; then
+    cat > "${MODEL_DIR}/kws/keywords.txt" <<'EOF'
+hey willow
+stop typing
+exit typing
+normal mode
+exit
+typing mode
+start typing
+EOF
+    echo "✓ Created default keywords.txt"
+fi
+
+mkdir -p "${HOME}/.config/willow"
+if [ ! -f "${HOME}/.config/willow/context.json" ] && [ -f "/usr/share/willow/context.json" ]; then
+    cp /usr/share/willow/context.json "${HOME}/.config/willow/context.json"
+    echo "✓ Installed default context.json"
+fi
+
+echo ""
+echo "Restart the service: systemctl --user restart willow.service"
+echo "Enroll your voice in: gnome-extensions prefs willow@saim"
 echo "==================================================================="
