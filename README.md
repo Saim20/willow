@@ -29,6 +29,7 @@ cmake -DCMAKE_INSTALL_PREFIX=/usr ..
 make -j$(nproc) && sudo cmake --install . --component willow
 
 cp -r ../../gnome-extension/willow@saim ~/.local/share/gnome-shell/extensions/
+glib-compile-schemas ~/.local/share/gnome-shell/extensions/willow@saim/schemas/
 ```
 
 ## Setup

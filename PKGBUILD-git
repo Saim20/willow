@@ -17,6 +17,7 @@ makedepends=(
     'cmake'
     'git'
     'gcc'
+    'glib2'
 )
 optdepends=(
     'cuda: for NVIDIA GPU acceleration'
@@ -100,7 +101,12 @@ package() {
     cp -r gnome-extension/willow@saim/* "$ext_dir/"
     
     # Compile GSettings schema
-    glib-compile-schemas "$ext_dir/schemas/" || true
+    glib-compile-schemas "$ext_dir/schemas/"
+
+    if [[ ! -f "$ext_dir/schemas/gschemas.compiled" ]]; then
+        printf "ERROR: gschemas.compiled was not generated\n"
+        return 1
+    fi
     
     # Install default configuration
     install -Dm644 config.json \
