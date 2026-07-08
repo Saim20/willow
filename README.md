@@ -26,7 +26,7 @@ sudo pacman -S gnome-shell sdbus-cpp jsoncpp libpulse ydotool curl cmake git gcc
 
 cd willow/service && mkdir -p build && cd build
 cmake -DCMAKE_INSTALL_PREFIX=/usr ..
-make -j$(nproc) && sudo cmake --install .
+make -j$(nproc) && sudo cmake --install . --component willow
 
 cp -r ../../gnome-extension/willow@saim ~/.local/share/gnome-shell/extensions/
 ```

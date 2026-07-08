@@ -106,6 +106,7 @@ target_compile_options(willow-service
 
 install(TARGETS willow-service
     RUNTIME DESTINATION bin
+    COMPONENT willow
 )
 
 configure_file(
@@ -116,10 +117,12 @@ configure_file(
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/com.github.saim.Willow.service
     DESTINATION share/dbus-1/services
+    COMPONENT willow
 )
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../dbus/com.github.saim.Willow.xml
     DESTINATION share/dbus-1/interfaces
+    COMPONENT willow
 )
 
 message(STATUS "")

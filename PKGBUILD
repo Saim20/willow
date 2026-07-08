@@ -1,7 +1,7 @@
 # Maintainer: Saim <saim20 at github dot com>
 pkgname=willow
 pkgver=3.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Simple offline configurable voice assistant for gnome"
 arch=('x86_64')
 url="https://github.com/Saim20/willow"
@@ -54,7 +54,7 @@ package() {
     cd "$srcdir/$pkgname"
 
     cd service/build
-    make DESTDIR="$pkgdir" install
+    DESTDIR="$pkgdir" cmake --install . --component willow
 
     cd "$srcdir/$pkgname"
 

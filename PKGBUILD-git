@@ -87,8 +87,7 @@ package() {
     
     # Install service binary and D-Bus files
     cd service/build
-    make DESTDIR="$pkgdir" install
-    
+    DESTDIR="$pkgdir" cmake --install . --component willow    
     cd "$srcdir/willow"
     
     # Install systemd service

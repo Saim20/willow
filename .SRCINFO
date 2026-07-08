@@ -1,7 +1,7 @@
 pkgbase = willow
 	pkgdesc = Simple offline configurable voice assistant for gnome
 	pkgver = 3.0.0
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/Saim20/willow
 	install = willow.install
 	arch = x86_64
@@ -18,7 +18,7 @@ pkgbase = willow
 	optdepends = speech-dispatcher: TTS feedback via spd-say
 	optdepends = espeak: TTS fallback when speech-dispatcher is unavailable
 	options = !debug
-	source = willow::git+https://github.com/Saim20/willow.git
+	source = willow::git+https://github.com/Saim20/willow.git#tag=v3.0.0
 	sha256sums = SKIP
 
 pkgname = willow
