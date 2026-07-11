@@ -1,28 +1,26 @@
 # Maintainer: Saim <saim20 at github dot com>
 pkgname=willow
 pkgver=3.0.0
-pkgrel=3
+pkgrel=4
 pkgdesc="Simple offline configurable voice assistant for gnome"
 arch=('x86_64')
 url="https://github.com/Saim20/willow"
 license=('MIT')
 depends=(
     'gnome-shell>=45'
-    'sdbus-cpp'
-    'jsoncpp'
     'libpulse'
     'ydotool'
     'curl'
 )
 makedepends=(
-    'cmake'
-    'git'
-    'gcc'
+    'rust'
+    'cargo'
     'glib2'
 )
 optdepends=(
     'speech-dispatcher: TTS feedback via spd-say'
     'espeak: TTS fallback when speech-dispatcher is unavailable'
+    'python-sentencepiece: encode custom KWS keywords at install/runtime'
 )
 options=('!debug')
 install=willow.install
@@ -30,20 +28,14 @@ source=("willow::git+https://github.com/Saim20/willow.git#tag=v3.0.0")
 sha256sums=('SKIP')
 
 build() {
-    cd "$srcdir/$pkgname/service"
-
-    rm -rf build
-    mkdir -p build
-    cd build
-
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr ..
-    make -j$(nproc)
+    cd "$srcdir/$pkgname/service-rs"
+    cargo build --release
 }
 
 check() {
-    cd "$srcdir/$pkgname/service/build"
+    cd "$srcdir/$pkgname/service-rs"
 
-    if [ ! -x "willow-service" ]; then
+    if [ ! -x "target/release/willow-service" ]; then
         printf "ERROR: willow-service binary not found or not executable!\n"
         return 1
     fi
@@ -54,10 +46,15 @@ check() {
 package() {
     cd "$srcdir/$pkgname"
 
-    cd service/build
-    DESTDIR="$pkgdir" cmake --install . --component willow
+    install -Dm755 service-rs/target/release/willow-service \
+        "$pkgdir/usr/bin/willow-service"
 
-    cd "$srcdir/$pkgname"
+    sed 's|@CMAKE_INSTALL_PREFIX@|/usr|g' \
+        dbus/com.github.saim.Willow.service.in \
+        > "$pkgdir/usr/share/dbus-1/services/com.github.saim.Willow.service"
+
+    install -Dm644 dbus/com.github.saim.Willow.xml \
+        "$pkgdir/usr/share/dbus-1/interfaces/com.github.saim.Willow.xml"
 
     install -Dm644 systemd/willow.service \
         "$pkgdir/usr/lib/systemd/user/willow.service"
@@ -87,4 +84,6 @@ package() {
     install -Dm644 SMART_WORKFLOWS_QUICKSTART.md "$pkgdir/usr/share/doc/$pkgname/SMART_WORKFLOWS_QUICKSTART.md"
 
     install -Dm755 download-model.sh "$pkgdir/usr/bin/willow-download-model"
+    install -Dm755 scripts/generate-keywords.py "$pkgdir/usr/share/willow/scripts/generate-keywords.py"
+    install -Dm644 data/kws-default-keywords.txt "$pkgdir/usr/share/willow/kws-default-keywords.txt"
 }

@@ -62,7 +62,8 @@ export class PreferencesBuilder {
     /**
      * Create an entry row
      */
-    createEntryRow(title, subtitle, settingKey, placeholder, group) {
+    createEntryRow(title, subtitle, settingKey, placeholder, group, options = {}) {
+        const syncOnChange = options.syncOnChange !== false;
         const row = new Adw.ActionRow({
             title: title,
             subtitle: subtitle,
@@ -76,8 +77,8 @@ export class PreferencesBuilder {
 
         this._settings.bind(settingKey, entry, 'text', Gio.SettingsBindFlags.DEFAULT);
         
-        // Trigger sync when changed
-        if (this._syncCallback) {
+        // Trigger sync when changed (optional — hotword uses Apply instead)
+        if (this._syncCallback && syncOnChange) {
             this._settings.connect(`changed::${settingKey}`, () => {
                 this._syncCallback();
             });

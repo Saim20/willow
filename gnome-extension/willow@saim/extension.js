@@ -40,6 +40,11 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         this._modelsLoaded = false;
         this._bufferIsPartial = false;
         this._speakerEnrolled = false;
+        this._enrollmentState = 'idle';
+        this._enrollmentSamples = 0;
+        this._enrollmentBufferFraction = 0;
+        this._enrollmentReenrolling = false;
+        this._activeHotword = '';
         this._audioActive = false;
         this._autoStartAttempted = false;
         this._dbusConnected = false;
@@ -247,7 +252,7 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     }
     
     _setupSettingsHandlers() {
-        const syncableKeys = ['hotword', 'command-threshold'];
+        const syncableKeys = ['command-threshold'];
         
         syncableKeys.forEach(key => {
             this._settings.connect(`changed::${key}`, () => {
@@ -264,13 +269,9 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         if (!this._proxy || !this._dbusConnected) return;
         
         try {
-            const hotword = this._settings.get_string('hotword');
             const threshold = this._settings.get_int('command-threshold') / 100.0;
-            
-            this._proxy.SetConfigValueRemote('hotword', new GLib.Variant('s', hotword));
             this._proxy.SetConfigValueRemote('command_threshold', new GLib.Variant('d', threshold));
-            
-            console.log('Willow: Settings synced to service');
+            console.log('Willow: Command threshold synced to service');
         } catch (e) {
             console.error('Willow: Error syncing settings:', e);
         }
@@ -427,6 +428,21 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         if (status.speaker_enrolled !== undefined) {
             this._speakerEnrolled = status.speaker_enrolled.unpack();
         }
+        if (status.enrollment_state !== undefined) {
+            this._enrollmentState = status.enrollment_state.unpack();
+        }
+        if (status.enrollment_samples !== undefined) {
+            this._enrollmentSamples = status.enrollment_samples.unpack();
+        }
+        if (status.enrollment_buffer_fraction !== undefined) {
+            this._enrollmentBufferFraction = status.enrollment_buffer_fraction.unpack();
+        }
+        if (status.enrollment_reenrolling !== undefined) {
+            this._enrollmentReenrolling = status.enrollment_reenrolling.unpack();
+        }
+        if (status.hotword !== undefined) {
+            this._activeHotword = status.hotword.unpack();
+        }
         if (status.current_mode !== undefined) {
             this._currentMode = status.current_mode.unpack();
         }
@@ -460,10 +476,12 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     
     _onError(message, details) {
         console.error('Willow:', message, details);
+        Main.notify('Willow', `${message}: ${details}`);
     }
     
     _onNotification(title, message, urgency) {
         console.log(`Willow notification: ${title} - ${message}`);
+        Main.notify(title, message);
     }
     
     _updateDisplay() {
@@ -534,14 +552,26 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         if (this._restartItem) this._restartItem.setSensitive(this._modelsLoaded);
 
         if (this._speakerStatusItem) {
-            if (this._speakerEnrolled) {
+            if (this._enrollmentState === 'recording') {
+                const next = this._enrollmentSamples + 1;
+                const within = Math.round(Math.min(this._enrollmentBufferFraction, 1) * 100);
+                this._speakerStatusItem.label.text = this._enrollmentReenrolling
+                    ? `Voice: Re-enrolling ${next}/3 (${within}%)`
+                    : `Voice: Enrolling ${next}/3 (${within}%)`;
+            } else if (this._speakerEnrolled) {
                 this._speakerStatusItem.label.text = 'Voice: Enrolled';
+            } else if (this._enrollmentState === 'failed') {
+                this._speakerStatusItem.label.text = 'Voice: Enrollment failed';
             } else {
                 this._speakerStatusItem.label.text = 'Voice: Not enrolled';
             }
         }
         if (this._enrollItem) {
-            this._enrollItem.setSensitive(this._modelsLoaded && !this._speakerEnrolled);
+            this._enrollItem.label.text = this._speakerEnrolled
+                ? 'Re-enroll Voice Profile'
+                : 'Enroll Voice Profile';
+            this._enrollItem.setSensitive(this._modelsLoaded &&
+                this._enrollmentState !== 'recording');
         }
     }
     

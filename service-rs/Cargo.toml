@@ -1,0 +1,20 @@
+[package]
+name = "willow-service"
+version = "3.0.0"
+edition = "2021"
+description = "Willow offline voice assistant D-Bus service"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+dirs = "6"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-onnx = "1.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5", features = ["tokio"] }
+zvariant = "5"

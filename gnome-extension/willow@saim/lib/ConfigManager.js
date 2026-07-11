@@ -79,7 +79,7 @@ export class ConfigManager {
     /**
      * Save configuration to file
      */
-    saveConfig(config) {
+    saveConfig(config, notifyService = true) {
         try {
             // Ensure parent directory exists
             const parentDir = this._configFile.get_parent();
@@ -107,9 +107,10 @@ export class ConfigManager {
             this._configFile.replace_contents(configJson, null, false, Gio.FileCreateFlags.NONE, null);
             this._config = config; // Store the clean version internally
             
-            // Notify D-Bus service of config change
-            this._notifyServiceConfigChanged(config);
-            
+            if (notifyService) {
+                this._notifyServiceConfigChanged(config);
+            }
+
             return true;
         } catch (e) {
             console.log(`ConfigManager: Error saving config: ${e}`);
@@ -146,7 +147,8 @@ export class ConfigManager {
         config.hotword = this._settings.get_string('hotword');
         config.command_threshold = this._settings.get_int('command-threshold');
 
-        return this.saveConfig(config);
+        // Persist locally only; push hotword via Apply button, threshold via SetConfigValue.
+        return this.saveConfig(config, false);
     }
 
     /**
@@ -169,6 +171,44 @@ export class ConfigManager {
 
         this._config = this._filterComments(config);
         this.syncConfigToSettings();
+    }
+
+    /**
+     * Push the current config JSON to the running service (explicit user action).
+     */
+    pushConfigToService(callback) {
+        if (!this._proxy) {
+            callback(false, 'Service not connected');
+            return;
+        }
+
+        const config = this.getConfig();
+        const configJson = JSON.stringify(config);
+        this._proxy.UpdateConfigRemote(configJson, (result, error) => {
+            if (error) {
+                callback(false, String(error));
+                return;
+            }
+            callback(true, null);
+        });
+    }
+
+    /**
+     * Push hotword directly to the running service for immediate feedback.
+     */
+    applyHotwordToService(hotword, callback) {
+        if (!this._proxy) {
+            callback(false, 'Service not connected');
+            return;
+        }
+
+        this._proxy.SetConfigValueRemote('hotword', new GLib.Variant('s', hotword), (result, error) => {
+            if (error) {
+                callback(false, String(error));
+                return;
+            }
+            callback(true, null);
+        });
     }
 
     /**

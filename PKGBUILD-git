@@ -8,21 +8,19 @@ url="https://github.com/Saim20/willow"
 license=('MIT')
 depends=(
     'gnome-shell>=45'
-    'sdbus-cpp'
-    'jsoncpp'
     'libpulse'
     'ydotool'
 )
 makedepends=(
-    'cmake'
+    'rust'
+    'cargo'
     'git'
-    'gcc'
     'glib2'
 )
 optdepends=(
-    'cuda: for NVIDIA GPU acceleration'
-    'vulkan-icd-loader: for Vulkan GPU acceleration (AMD/Intel/NVIDIA)'
-    'vulkan-headers: for Vulkan GPU acceleration build support'
+    'speech-dispatcher: TTS feedback via spd-say'
+    'espeak: TTS fallback when speech-dispatcher is unavailable'
+    'python-sentencepiece: encode custom KWS keywords at install/runtime'
 )
 options=('!debug')
 provides=('willow')
@@ -31,100 +29,57 @@ install=willow.install
 source=("git+https://github.com/Saim20/willow.git")
 sha256sums=('SKIP')
 
-# Build options
-: ${ENABLE_CUDA:=0}
-: ${ENABLE_VULKAN:=0}
-_enable_cuda=${ENABLE_CUDA}
-_enable_vulkan=${ENABLE_VULKAN}
-
 pkgver() {
     cd "$srcdir/willow"
     printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
-prepare() {
-    cd "$srcdir/willow"
-    
-    # Clone whisper.cpp if not present
-    if [ ! -d "whisper.cpp" ]; then
-        printf "Cloning whisper.cpp...\n"
-        git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git
-    fi
-}
-
 build() {
-    cd "$srcdir/willow"
-    
-    # Build the C++ service with whisper.cpp
-    cd service
-    
-    # Create build directory
-    rm -rf build
-    mkdir -p build
-    cd build
-    
-    # Configure with CMake
-    local cmake_args=(
-        -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_INSTALL_PREFIX=/usr
-        -DWHISPER_CPP_DIR="$srcdir/willow/whisper.cpp"
-    )
-    
-    # Add GPU acceleration options
-    if [ "$_enable_cuda" = "1" ]; then
-        cmake_args+=(-DGGML_CUDA=ON)
-    fi
-    
-    if [ "$_enable_vulkan" = "1" ]; then
-        cmake_args+=(-DGGML_VULKAN=ON)
-    fi
-    
-    cmake "${cmake_args[@]}" ..
-    make -j$(nproc)
+    cd "$srcdir/willow/service-rs"
+    cargo build --release
 }
 
 package() {
     cd "$srcdir/willow"
-    
-    # Install service binary and D-Bus files
-    cd service/build
-    DESTDIR="$pkgdir" cmake --install . --component willow    
-    cd "$srcdir/willow"
-    
-    # Install systemd service
+
+    install -Dm755 service-rs/target/release/willow-service \
+        "$pkgdir/usr/bin/willow-service"
+
+    sed 's|@CMAKE_INSTALL_PREFIX@|/usr|g' \
+        dbus/com.github.saim.Willow.service.in \
+        > "$pkgdir/usr/share/dbus-1/services/com.github.saim.Willow.service"
+
+    install -Dm644 dbus/com.github.saim.Willow.xml \
+        "$pkgdir/usr/share/dbus-1/interfaces/com.github.saim.Willow.xml"
+
     install -Dm644 systemd/willow.service \
         "$pkgdir/usr/lib/systemd/user/willow.service"
-    
-    # Install GNOME extension
+
     local ext_dir="$pkgdir/usr/share/gnome-shell/extensions/willow@saim"
     mkdir -p "$ext_dir"
     cp -r gnome-extension/willow@saim/* "$ext_dir/"
-    
-    # Compile GSettings schema
+
     glib-compile-schemas "$ext_dir/schemas/"
 
     if [[ ! -f "$ext_dir/schemas/gschemas.compiled" ]]; then
         printf "ERROR: gschemas.compiled was not generated\n"
         return 1
     fi
-    
-    # Install default configuration
+
     install -Dm644 config.json \
         "$pkgdir/usr/share/willow/config.json"
-    
-    # Install context configuration for smart workflows
+
     install -Dm644 context.json \
         "$pkgdir/usr/share/willow/context.json"
-    
-    # Install LICENSE
+
     install -Dm644 LICENSE \
         "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    
-    # Install documentation
+
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 SMART_WORKFLOWS.md "$pkgdir/usr/share/doc/$pkgname/SMART_WORKFLOWS.md"
     install -Dm644 SMART_WORKFLOWS_QUICKSTART.md "$pkgdir/usr/share/doc/$pkgname/SMART_WORKFLOWS_QUICKSTART.md"
-    
-    # Install download helper script
+
     install -Dm755 download-model.sh "$pkgdir/usr/bin/willow-download-model"
+    install -Dm755 scripts/generate-keywords.py "$pkgdir/usr/share/willow/scripts/generate-keywords.py"
+    install -Dm644 data/kws-default-keywords.txt "$pkgdir/usr/share/willow/kws-default-keywords.txt"
 }

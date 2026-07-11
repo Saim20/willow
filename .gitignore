@@ -3,7 +3,7 @@ bak
 model
 
 # Build artifacts
-service/build/
+service-rs/target/
 whisper.cpp/
 *.o
 *.so

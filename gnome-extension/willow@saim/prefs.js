@@ -26,7 +26,7 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         this._commandManager = new CommandManager(this._configManager);
         this._prefsBuilder = new PreferencesBuilder(settings);
         this._statusManager = new StatusManager();
-        this._modelManager = new WhisperModelManager(this._configManager);
+        this._modelManager = new WhisperModelManager(this._configManager, this.dir);
         this._logViewer = new LogViewer();
         
         // Setup automatic sync with debouncing
@@ -49,6 +49,29 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         this._createCommandsPage(window, settings);
         this._createLogsPage(window, settings);
         this._createAboutPage(window, settings);
+
+        this._setupServiceSignals(window);
+    }
+
+    _setupServiceSignals(window) {
+        const proxy = this._configManager?._proxy;
+        if (!proxy) {
+            return;
+        }
+
+        proxy.connectSignal('Error', (_proxy, _sender, [message, details]) => {
+            this._showToast(window, `${message}: ${details}`, 8);
+            this._refreshVoicePageStatus();
+        });
+
+        proxy.connectSignal('Notification', (_proxy, _sender, [title, message]) => {
+            this._showToast(window, `${title}: ${message}`, 5);
+            this._refreshVoicePageStatus();
+        });
+
+        proxy.connectSignal('StatusChanged', () => {
+            this._refreshVoicePageStatus();
+        });
     }
 
     _createGeneralPage(window, settings) {
@@ -65,9 +88,15 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
         this._prefsBuilder.createEntryRow(
             'Activation Hotword',
-            'Word used to activate command mode from normal mode',
+            'Saved locally — open the Voice tab and click Apply Hotword to activate',
             'hotword',
             'hey willow',
+            recognitionGroup,
+            {syncOnChange: false}
+        );
+        this._hotwordHintRow = this._prefsBuilder.createInfoRow(
+            'Hotword Status',
+            'Open the Voice tab to apply changes to the running service',
             recognitionGroup
         );
 
@@ -110,7 +139,13 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             'document-save-symbolic',
             () => {
                 this._configManager.syncSettingsToConfig();
-                this._showToast(window, 'Settings synced to D-Bus service');
+                this._configManager.pushConfigToService((ok, error) => {
+                    if (!ok) {
+                        this._showToast(window, `Sync failed: ${error}`, 8);
+                        return;
+                    }
+                    this._showToast(window, 'Settings synced to D-Bus service');
+                });
             },
             serviceGroup
         );
@@ -213,6 +248,59 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             icon_name: 'audio-input-microphone-symbolic',
         });
 
+        const statusGroup = this._prefsBuilder.createGroup(
+            'Live Service Status',
+            'Shows what the Willow service is doing right now'
+        );
+
+        this._micStatusRow = this._prefsBuilder.createInfoRow(
+            'Microphone',
+            'Checking…',
+            statusGroup
+        );
+        this._hotwordStatusRow = this._prefsBuilder.createInfoRow(
+            'Active Hotword',
+            'Checking…',
+            statusGroup
+        );
+        this._modelsStatusRow = this._prefsBuilder.createInfoRow(
+            'Speech Models',
+            'Checking…',
+            statusGroup
+        );
+        this._encodingStatusRow = this._prefsBuilder.createInfoRow(
+            'Hotword Encoding',
+            'Checking…',
+            statusGroup
+        );
+
+        page.add(statusGroup);
+
+        const hotwordGroup = this._prefsBuilder.createGroup(
+            'Hotword',
+            'Say this phrase in normal mode to activate Willow'
+        );
+
+        this._prefsBuilder.createEntryRow(
+            'Activation Hotword',
+            'Use short, clear phrases with common English words',
+            'hotword',
+            'hey willow',
+            hotwordGroup,
+            {syncOnChange: false}
+        );
+
+        this._applyHotwordButton = this._prefsBuilder.createButtonRow(
+            'Apply Hotword',
+            'Encode and activate the hotword on the running service',
+            'Apply Now',
+            'emblem-ok-symbolic',
+            () => this._applyHotword(window),
+            hotwordGroup
+        );
+
+        page.add(hotwordGroup);
+
         const verifyGroup = this._prefsBuilder.createGroup(
             'Speaker Verification',
             'Enroll your voice so only you can activate Willow after the hotword'
@@ -224,15 +312,29 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             verifyGroup
         );
 
+        this._enrollProgressRow = new Adw.ActionRow({
+            title: 'Enrollment Progress',
+            subtitle: 'Press Start, then speak naturally',
+            visible: false,
+        });
+        this._enrollProgressBar = new Gtk.ProgressBar({
+            valign: Gtk.Align.CENTER,
+            width_request: 220,
+            show_text: true,
+            fraction: 0,
+        });
+        this._enrollProgressRow.add_suffix(this._enrollProgressBar);
+        verifyGroup.add(this._enrollProgressRow);
+
         this._prefsBuilder.createInfoRow(
             'How it works',
-            'After saying the hotword, Willow compares your voice to the enrolled profile. Speak naturally during enrollment — 3 short samples are collected automatically.',
+            'The microphone must be listening before enrollment starts. Willow records 3 short speech samples (~2 seconds each) while you talk.',
             verifyGroup
         );
 
-        this._prefsBuilder.createButtonRow(
+        this._enrollStartButton = this._prefsBuilder.createButtonRow(
             'Start Enrollment',
-            'Record voice samples while the service is running',
+            'Record or replace your voice profile (3 short speech samples)',
             'Start',
             'microphone-sensitivity-high-symbolic',
             () => this._startSpeakerEnrollment(window),
@@ -260,11 +362,161 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         page.add(verifyGroup);
         window.add(page);
 
-        this._enrollPollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
-            this._refreshEnrollmentStatus();
+        this._voicePollFast = false;
+        this._voicePollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            this._refreshVoicePageStatus();
             return GLib.SOURCE_CONTINUE;
         });
-        this._refreshEnrollmentStatus();
+        this._refreshVoicePageStatus();
+    }
+
+    _applyHotword(window) {
+        const hotword = this._settings.get_string('hotword').trim();
+        if (!hotword) {
+            this._showToast(window, 'Enter a hotword first');
+            return;
+        }
+
+        this._hotwordStatusRow.subtitle = 'Applying hotword…';
+        this._configManager.syncSettingsToConfig();
+        this._configManager.applyHotwordToService(hotword, (ok, error) => {
+            if (!ok) {
+                this._hotwordStatusRow.subtitle = `Failed: ${error}`;
+                this._showToast(window, `Hotword failed: ${error}`, 8);
+                return;
+            }
+            this._hotwordStatusRow.subtitle = `Listening for "${hotword}"`;
+            if (this._hotwordHintRow) {
+                this._hotwordHintRow.subtitle = `Active on service: ${hotword}`;
+            }
+            this._showToast(window, `Hotword applied: ${hotword}`, 5);
+            this._refreshVoicePageStatus();
+        });
+    }
+
+    _refreshVoicePageStatus() {
+        const proxy = this._getProxy();
+
+        if (!proxy) {
+            const disconnected = 'Service not connected — start willow.service';
+            if (this._micStatusRow) this._micStatusRow.subtitle = disconnected;
+            if (this._hotwordStatusRow) this._hotwordStatusRow.subtitle = disconnected;
+            if (this._modelsStatusRow) this._modelsStatusRow.subtitle = disconnected;
+            if (this._encodingStatusRow) this._encodingStatusRow.subtitle = disconnected;
+            if (this._enrollStatusRow) this._enrollStatusRow.subtitle = disconnected;
+            return;
+        }
+
+        proxy.GetStatusRemote((statusResult, statusError) => {
+            if (statusError || !statusResult || !statusResult[0]) {
+                const busy = statusError
+                    ? `Service busy or unavailable (${statusError})`
+                    : 'Could not read service status';
+                if (this._micStatusRow) this._micStatusRow.subtitle = busy;
+                if (this._enrollStatusRow) this._enrollStatusRow.subtitle = busy;
+                return;
+            }
+            const status = statusResult[0];
+            const audioActive = status.audio_active?.unpack?.() ?? false;
+            const modelsLoaded = status.models_loaded?.unpack?.() ?? false;
+            const hotword = status.hotword?.unpack?.() ?? '';
+            const encodingReady = status.keyword_encoding_ready?.unpack?.() ?? false;
+            const enrolled = status.speaker_enrolled?.unpack?.() ?? false;
+            const enrollState = status.enrollment_state?.unpack?.() ?? 'idle';
+            const enrollSamples = status.enrollment_samples?.unpack?.() ?? 0;
+            const enrollBuffer = status.enrollment_buffer_fraction?.unpack?.() ?? 0;
+            const reenrolling = status.enrollment_reenrolling?.unpack?.() ?? false;
+
+            if (this._micStatusRow) {
+                this._micStatusRow.subtitle = audioActive
+                    ? 'Listening — microphone is active'
+                    : modelsLoaded
+                        ? 'Not listening — click Start Enrollment or restart the service'
+                        : 'Unavailable — download models first';
+            }
+
+            if (this._hotwordStatusRow) {
+                this._hotwordStatusRow.subtitle = hotword
+                    ? `Service is listening for "${hotword}"`
+                    : 'No hotword configured';
+            }
+
+            if (this._modelsStatusRow) {
+                this._modelsStatusRow.subtitle = modelsLoaded
+                    ? 'Loaded and ready'
+                    : 'Missing — download models on the Models tab';
+            }
+
+            if (this._encodingStatusRow) {
+                this._encodingStatusRow.subtitle = encodingReady
+                    ? 'Ready — hotword changes can be encoded'
+                    : 'Unavailable — install python-sentencepiece and reinstall Willow';
+            }
+
+            if (this._hotwordHintRow) {
+                this._hotwordHintRow.subtitle = hotword
+                    ? `Active on service: ${hotword}`
+                    : 'Apply hotword from the Voice tab';
+            }
+
+            const recording = enrollState === 'recording';
+            const sampleFraction = Math.min(enrollBuffer, 1);
+            if (this._enrollProgressRow) {
+                this._enrollProgressRow.visible = recording || enrollState === 'complete' || enrollState === 'failed';
+            }
+            if (this._enrollProgressBar) {
+                const fraction = Math.min((enrollSamples + sampleFraction) / 3, 1);
+                this._enrollProgressBar.fraction = fraction;
+                const pct = Math.round(fraction * 100);
+                this._enrollProgressBar.text = recording
+                    ? `${enrollSamples}/3 (${pct}%)`
+                    : `${enrollSamples}/3`;
+            }
+            if (this._enrollProgressRow) {
+                if (recording) {
+                    const nextSample = enrollSamples + 1;
+                    const within = Math.round(sampleFraction * 100);
+                    this._enrollProgressRow.subtitle =
+                        `Recording sample ${nextSample}/3 (${within}% of current sample) — keep speaking`;
+                } else if (enrollState === 'complete' || enrolled) {
+                    this._enrollProgressRow.subtitle = 'Enrollment complete';
+                } else if (enrollState === 'failed') {
+                    this._enrollProgressRow.subtitle = 'Enrollment failed — try again';
+                } else {
+                    this._enrollProgressRow.subtitle = 'Press Start, then speak naturally';
+                }
+            }
+
+            if (this._enrollStatusRow) {
+                if (recording) {
+                    this._enrollStatusRow.subtitle = reenrolling
+                        ? `Re-enrolling — sample ${enrollSamples + 1}/3 (speak clearly)`
+                        : `Recording sample ${enrollSamples + 1}/3 — speak clearly`;
+                } else if (enrolled) {
+                    this._enrollStatusRow.subtitle = 'Voice profile enrolled — press Start to re-enroll';
+                } else if (enrollState === 'complete') {
+                    this._enrollStatusRow.subtitle = 'Enrollment complete';
+                } else if (enrollState === 'failed') {
+                    this._enrollStatusRow.subtitle = 'Enrollment failed — ensure the mic is active and try again';
+                } else if (!audioActive) {
+                    this._enrollStatusRow.subtitle = 'Ready — microphone will start when you press Start';
+                } else {
+                    this._enrollStatusRow.subtitle = 'Not enrolled — press Start and speak for ~6 seconds total';
+                }
+            }
+
+            if (this._enrollStartButton?.widget) {
+                const canStart = modelsLoaded && enrollState !== 'recording';
+                this._enrollStartButton.widget.sensitive = canStart;
+                this._enrollStartButton.widget.set_label(
+                    enrolled || reenrolling ? 'Re-enroll' : 'Start'
+                );
+            }
+
+            if (this._applyHotwordButton?.widget) {
+                this._applyHotwordButton.widget.sensitive = encodingReady && Boolean(hotword || this._settings.get_string('hotword').trim());
+            }
+        });
     }
 
     _getProxy() {
@@ -272,37 +524,7 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
     }
 
     _refreshEnrollmentStatus() {
-        const proxy = this._getProxy();
-        if (!proxy || !this._enrollStatusRow) {
-            return;
-        }
-
-        try {
-            proxy.GetSpeakerEnrollmentStatusRemote((result, error) => {
-                if (error || !result || !result[0]) {
-                    this._enrollStatusRow.subtitle = 'Service not connected';
-                    return;
-                }
-                const status = result[0];
-                const state = status.state?.unpack?.() ?? 'idle';
-                const samples = status.samples?.unpack?.() ?? 0;
-                const enrolled = status.enrolled?.unpack?.() ?? false;
-
-                if (enrolled) {
-                    this._enrollStatusRow.subtitle = 'Voice profile enrolled';
-                } else if (state === 'recording') {
-                    this._enrollStatusRow.subtitle = `Recording sample ${samples}/3 — keep speaking naturally`;
-                } else if (state === 'complete') {
-                    this._enrollStatusRow.subtitle = 'Enrollment complete';
-                } else if (state === 'failed') {
-                    this._enrollStatusRow.subtitle = 'Enrollment failed — try again';
-                } else {
-                    this._enrollStatusRow.subtitle = 'Not enrolled';
-                }
-            });
-        } catch (e) {
-            this._enrollStatusRow.subtitle = 'Service not available';
-        }
+        this._refreshVoicePageStatus();
     }
 
     _startSpeakerEnrollment(window) {
@@ -311,13 +533,26 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             this._showToast(window, 'Willow service not connected');
             return;
         }
+
+        if (this._enrollProgressRow) {
+            this._enrollProgressRow.visible = true;
+        }
+        if (this._enrollProgressBar) {
+            this._enrollProgressBar.fraction = 0;
+            this._enrollProgressBar.text = '0/3';
+        }
+        if (this._enrollStatusRow) {
+            this._enrollStatusRow.subtitle = 'Starting enrollment…';
+        }
+
         proxy.StartSpeakerEnrollmentRemote((result, error) => {
             if (error) {
-                this._showToast(window, `Enrollment failed: ${error}`);
+                this._showToast(window, `Enrollment failed: ${error}`, 8);
+                this._refreshVoicePageStatus();
                 return;
             }
-            this._showToast(window, 'Enrollment started — speak for a few seconds');
-            this._refreshEnrollmentStatus();
+            this._showToast(window, 'Enrollment started — speak naturally for about 6 seconds', 6);
+            this._refreshVoicePageStatus();
         });
     }
 
@@ -665,19 +900,16 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         }
     }
 
-    _showToast(window, message) {
-        // Simple console log for compatibility
+    _showToast(window, message, timeoutSeconds = 3) {
         console.log(`Willow: ${message}`);
-        
-        // Try to show a toast if available
+
         try {
             const toast = new Adw.Toast({
                 title: message,
-                timeout: 3,
+                timeout: timeoutSeconds,
             });
             window.add_toast(toast);
         } catch (e) {
-            // Fallback: just log
             console.log(`Toast: ${message}`);
         }
     }
