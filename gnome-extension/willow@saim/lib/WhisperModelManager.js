@@ -42,10 +42,24 @@ export class WhisperModelManager {
         ];
     }
 
+    _getActiveBundles() {
+        if (!this._isSpeakerVerificationEnabled()) {
+            return this._bundles.filter(bundle => bundle.id !== 'speaker');
+        }
+        return this._bundles;
+    }
+
+    _isSpeakerVerificationEnabled() {
+        const config = this._configManager?.getConfig();
+        return config?.speaker_verification?.enabled ?? false;
+    }
+
     createModelGroup(window) {
         const group = new Adw.PreferencesGroup({
             title: 'Speech Models',
-            description: 'Sherpa-onnx models for keyword spotting, streaming ASR, and speaker verification',
+            description: this._isSpeakerVerificationEnabled()
+                ? 'Sherpa-onnx models for keyword spotting, streaming ASR, and speaker verification'
+                : 'Sherpa-onnx models for keyword spotting and streaming ASR',
         });
 
         this._group = group;
@@ -65,7 +79,7 @@ export class WhisperModelManager {
         });
         this._group.add(this._statusRow);
 
-        for (const bundle of this._bundles) {
+        for (const bundle of this._getActiveBundles()) {
             const row = new Adw.ActionRow({
                 title: bundle.name,
                 subtitle: `${bundle.description} • ${bundle.size}`,
@@ -89,7 +103,9 @@ export class WhisperModelManager {
 
         const downloadRow = new Adw.ActionRow({
             title: 'Download All Models',
-            subtitle: 'Downloads sherpa-onnx models (~160 MB total)',
+            subtitle: this._isSpeakerVerificationEnabled()
+                ? 'Downloads sherpa-onnx models (~160 MB total)'
+                : 'Downloads hotword and ASR models (~135 MB total)',
         });
         const downloadButton = new Gtk.Button({
             icon_name: 'folder-download-symbolic',
@@ -144,7 +160,7 @@ export class WhisperModelManager {
     }
 
     _allInstalled() {
-        return this._bundles.every(bundle => bundle.check());
+        return this._getActiveBundles().every(bundle => bundle.check());
     }
 
     _refreshUI() {
@@ -152,8 +168,8 @@ export class WhisperModelManager {
             return;
         }
 
-        const installed = this._bundles.filter(b => b.check()).length;
-        const total = this._bundles.length;
+        const installed = this._getActiveBundles().filter(b => b.check()).length;
+        const total = this._getActiveBundles().length;
         const allReady = installed === total;
 
         this._statusRow.subtitle = allReady

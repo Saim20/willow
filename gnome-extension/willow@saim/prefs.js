@@ -301,65 +301,77 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
         page.add(hotwordGroup);
 
-        const verifyGroup = this._prefsBuilder.createGroup(
-            'Speaker Verification',
-            'Enroll your voice so only you can activate Willow after the hotword'
-        );
+        this._speakerVerificationEnabled =
+            this._configManager.getConfig().speaker_verification?.enabled ?? false;
 
-        this._enrollStatusRow = this._prefsBuilder.createInfoRow(
-            'Enrollment Status',
-            'Checking…',
-            verifyGroup
-        );
+        if (this._speakerVerificationEnabled) {
+            const verifyGroup = this._prefsBuilder.createGroup(
+                'Speaker Verification',
+                'Enroll your voice so only you can activate Willow after the hotword'
+            );
 
-        this._enrollProgressRow = new Adw.ActionRow({
-            title: 'Enrollment Progress',
-            subtitle: 'Press Start, then speak naturally',
-            visible: false,
-        });
-        this._enrollProgressBar = new Gtk.ProgressBar({
-            valign: Gtk.Align.CENTER,
-            width_request: 220,
-            show_text: true,
-            fraction: 0,
-        });
-        this._enrollProgressRow.add_suffix(this._enrollProgressBar);
-        verifyGroup.add(this._enrollProgressRow);
+            this._enrollStatusRow = this._prefsBuilder.createInfoRow(
+                'Enrollment Status',
+                'Checking…',
+                verifyGroup
+            );
 
-        this._prefsBuilder.createInfoRow(
-            'How it works',
-            'The microphone must be listening before enrollment starts. Willow records 3 short speech samples (~2 seconds each) while you talk.',
-            verifyGroup
-        );
+            this._enrollProgressRow = new Adw.ActionRow({
+                title: 'Enrollment Progress',
+                subtitle: 'Press Start, then follow the on-screen prompts',
+                visible: false,
+            });
+            this._enrollProgressBar = new Gtk.ProgressBar({
+                valign: Gtk.Align.CENTER,
+                width_request: 220,
+                show_text: true,
+                fraction: 0,
+            });
+            this._enrollProgressRow.add_suffix(this._enrollProgressBar);
+            verifyGroup.add(this._enrollProgressRow);
 
-        this._enrollStartButton = this._prefsBuilder.createButtonRow(
-            'Start Enrollment',
-            'Record or replace your voice profile (3 short speech samples)',
-            'Start',
-            'microphone-sensitivity-high-symbolic',
-            () => this._startSpeakerEnrollment(window),
-            verifyGroup
-        );
+            this._enrollPromptRow = this._prefsBuilder.createInfoRow(
+                'What to say',
+                'No magic phrase — Willow records 3 short samples (~2 seconds each). Try your hotword, a command, then anything else in your normal voice.',
+                verifyGroup
+            );
 
-        this._prefsBuilder.createButtonRow(
-            'Cancel Enrollment',
-            'Stop an in-progress enrollment session',
-            'Cancel',
-            'process-stop-symbolic',
-            () => this._cancelSpeakerEnrollment(window),
-            verifyGroup
-        );
+            this._prefsBuilder.createInfoRow(
+                'How it works',
+                'Press Start, then speak when prompted. Keep talking steadily until each sample completes. A desktop notification shows example phrases for each sample.',
+                verifyGroup
+            );
 
-        this._prefsBuilder.createButtonRow(
-            'Remove Voice Profile',
-            'Delete enrolled speaker data and disable verification',
-            'Remove Profile',
-            'user-trash-symbolic',
-            () => this._removeSpeakerProfile(window),
-            verifyGroup
-        );
+            this._enrollStartButton = this._prefsBuilder.createButtonRow(
+                'Start Enrollment',
+                'Record or replace your voice profile (3 short speech samples)',
+                'Start',
+                'microphone-sensitivity-high-symbolic',
+                () => this._startSpeakerEnrollment(window),
+                verifyGroup
+            );
 
-        page.add(verifyGroup);
+            this._prefsBuilder.createButtonRow(
+                'Cancel Enrollment',
+                'Stop an in-progress enrollment session',
+                'Cancel',
+                'process-stop-symbolic',
+                () => this._cancelSpeakerEnrollment(window),
+                verifyGroup
+            );
+
+            this._prefsBuilder.createButtonRow(
+                'Remove Voice Profile',
+                'Delete enrolled speaker data',
+                'Remove Profile',
+                'user-trash-symbolic',
+                () => this._removeSpeakerProfile(window),
+                verifyGroup
+            );
+
+            page.add(verifyGroup);
+        }
+
         window.add(page);
 
         this._voicePollFast = false;
@@ -422,16 +434,20 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             const hotword = status.hotword?.unpack?.() ?? '';
             const encodingReady = status.keyword_encoding_ready?.unpack?.() ?? false;
             const enrolled = status.speaker_enrolled?.unpack?.() ?? false;
+            const speakerVerificationEnabled =
+                status.speaker_verification_enabled?.unpack?.() ?? this._speakerVerificationEnabled;
+            this._speakerVerificationEnabled = speakerVerificationEnabled;
             const enrollState = status.enrollment_state?.unpack?.() ?? 'idle';
             const enrollSamples = status.enrollment_samples?.unpack?.() ?? 0;
             const enrollBuffer = status.enrollment_buffer_fraction?.unpack?.() ?? 0;
             const reenrolling = status.enrollment_reenrolling?.unpack?.() ?? false;
+            const enrollmentPrompt = status.enrollment_prompt?.unpack?.() ?? '';
 
             if (this._micStatusRow) {
                 this._micStatusRow.subtitle = audioActive
                     ? 'Listening — microphone is active'
                     : modelsLoaded
-                        ? 'Not listening — click Start Enrollment or restart the service'
+                        ? 'Not listening — restart the service or use the panel menu'
                         : 'Unavailable — download models first';
             }
 
@@ -476,8 +492,8 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
                 if (recording) {
                     const nextSample = enrollSamples + 1;
                     const within = Math.round(sampleFraction * 100);
-                    this._enrollProgressRow.subtitle =
-                        `Recording sample ${nextSample}/3 (${within}% of current sample) — keep speaking`;
+                    this._enrollProgressRow.subtitle = enrollmentPrompt
+                        || `Recording sample ${nextSample}/3 (${within}% of current sample) — keep speaking`;
                 } else if (enrollState === 'complete' || enrolled) {
                     this._enrollProgressRow.subtitle = 'Enrollment complete';
                 } else if (enrollState === 'failed') {
@@ -489,9 +505,10 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
             if (this._enrollStatusRow) {
                 if (recording) {
-                    this._enrollStatusRow.subtitle = reenrolling
-                        ? `Re-enrolling — sample ${enrollSamples + 1}/3 (speak clearly)`
-                        : `Recording sample ${enrollSamples + 1}/3 — speak clearly`;
+                    this._enrollStatusRow.subtitle = enrollmentPrompt
+                        || (reenrolling
+                            ? `Re-enrolling — sample ${enrollSamples + 1}/3 (speak clearly)`
+                            : `Recording sample ${enrollSamples + 1}/3 — speak clearly`);
                 } else if (enrolled) {
                     this._enrollStatusRow.subtitle = 'Voice profile enrolled — press Start to re-enroll';
                 } else if (enrollState === 'complete') {
@@ -551,7 +568,7 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
                 this._refreshVoicePageStatus();
                 return;
             }
-            this._showToast(window, 'Enrollment started — speak naturally for about 6 seconds', 6);
+            this._showToast(window, 'Enrollment started — follow the on-screen prompts and speak steadily', 6);
             this._refreshVoicePageStatus();
         });
     }
@@ -636,7 +653,9 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
         this._prefsBuilder.createInfoRow(
             'Model Bundles',
-            'KWS handles hotword detection in normal mode. Streaming ASR powers command and typing modes. Speaker model enables voice verification.',
+            this._speakerVerificationEnabled
+                ? 'KWS handles hotword detection in normal mode. Streaming ASR powers command and typing modes. Speaker model enables voice verification.'
+                : 'KWS handles hotword detection in normal mode. Streaming ASR powers command and typing modes.',
             infoGroup
         );
 
@@ -769,19 +788,19 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
         this._prefsBuilder.createInfoRow(
             'Features',
-            'Offline sherpa-onnx speech pipeline • Speaker verification • Real-time typing • D-Bus integration • Wayland ydotool support',
+            'Offline sherpa-onnx speech pipeline • Real-time typing • D-Bus integration • Wayland ydotool support',
             infoGroup
         );
 
         this._prefsBuilder.createInfoRow(
             'Technology',
-            'Sherpa-onnx speech pipeline • Speaker verification • D-Bus service • Wayland ydotool support',
+            'Sherpa-onnx speech pipeline • D-Bus service • Wayland ydotool support',
             infoGroup
         );
 
         this._prefsBuilder.createInfoRow(
             'Usage',
-            'Say "hey willow" to activate • Streaming partial text in panel • Enroll voice in Voice tab',
+            'Say "hey willow" to activate • Streaming partial text in panel • Configure hotword in Voice tab',
             infoGroup
         );
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +7,7 @@ use anyhow::Result;
 use tracing::error;
 
 use crate::audio::MicCapture;
-use crate::commands::{CommandExecutor, CommandIntentResolver};
+use crate::commands::{CommandExecutor, CommandIntentResolver, CommandWorker};
 use crate::config::{load_config, save_config, WillowConfig};
 use crate::modes::ModeStateMachine;
 use crate::models::{keyword_encoding_available, ModelPaths};
@@ -34,6 +35,7 @@ pub enum ServiceEvent {
     },
     StatusChanged,
     Error { message: String, details: String },
+    #[allow(dead_code)]
     Notification {
         title: String,
         message: String,
@@ -46,6 +48,8 @@ pub struct ServiceCore {
     inner: Arc<Mutex<ServiceInner>>,
     event_cb: Mutex<Option<EventCallback>>,
     audio_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    audio_stop: Mutex<Option<Arc<AtomicBool>>>,
+    command_executed_cb: Arc<Mutex<Option<Arc<dyn Fn(String, String, f64) + Send + Sync>>>>,
 }
 
 struct ServiceInner {
@@ -74,6 +78,110 @@ impl ServiceInner {
         self.mode_machine
             .handle_transcription(result, &mut self.pipeline)
     }
+
+    /// Process one mic chunk under a single lock (no re-entrant callbacks).
+    fn process_audio_chunk(&mut self, chunk: &[f32]) -> Vec<ServiceEvent> {
+        let mut events = Vec::new();
+        let pipeline_events = self.pipeline.process_audio(chunk);
+
+        if pipeline_events.asr_unavailable {
+            events.push(ServiceEvent::Error {
+                message: "ASR Unavailable".into(),
+                details: "Speech recognition model not loaded".into(),
+            });
+        }
+
+        for keyword in &pipeline_events.keywords {
+            if let Some(change) = self.handle_keyword(keyword) {
+                events.push(ServiceEvent::ModeChanged {
+                    new_mode: change.new_mode.as_str().to_string(),
+                    old_mode: change.old_mode.as_str().to_string(),
+                });
+                events.push(ServiceEvent::StatusChanged);
+            }
+        }
+
+        for reason in pipeline_events.speaker_fails {
+            events.push(ServiceEvent::SpeakerVerificationFailed(reason.clone()));
+            if self.config.tts.enabled && self.config.tts.events.errors {
+                self.mode_machine.speak_speaker_rejected();
+            }
+        }
+
+        for (phrase, blocked) in pipeline_events.command_pending {
+            events.push(ServiceEvent::CommandPending { phrase, blocked });
+        }
+
+        for result in pipeline_events.transcriptions {
+            events.push(ServiceEvent::PartialBufferChanged {
+                partial: result.text.clone(),
+                is_final: result.is_final,
+            });
+            if matches!(self.mode_machine.mode(), Mode::Command | Mode::Typing)
+                && !result.text.is_empty()
+            {
+                events.push(ServiceEvent::BufferChanged(result.text.clone()));
+            }
+            if let Some(change) = self.handle_transcription(&result) {
+                events.push(ServiceEvent::ModeChanged {
+                    new_mode: change.new_mode.as_str().to_string(),
+                    old_mode: change.old_mode.as_str().to_string(),
+                });
+                events.push(ServiceEvent::StatusChanged);
+            } else if result.is_endpoint || result.is_final {
+                events.push(ServiceEvent::StatusChanged);
+            }
+        }
+
+        if self.pipeline.speaker.enrollment_state() == EnrollmentState::Recording {
+            let before = self.pipeline.speaker.enrollment_progress();
+            let state_before = self.pipeline.speaker.enrollment_state();
+            self.pipeline.speaker.add_enrollment_audio(chunk);
+            let after = self.pipeline.speaker.enrollment_progress();
+            let state_after = self.pipeline.speaker.enrollment_state();
+
+            if state_before == EnrollmentState::Recording
+                && state_after == EnrollmentState::Failed
+                && after < 3
+            {
+                events.push(ServiceEvent::Error {
+                    message: "Enrollment Error".into(),
+                    details: if after == 0 {
+                        "Enrollment timed out — speak steadily right after pressing Start".into()
+                    } else {
+                        "Enrollment failed — speak louder and try again".into()
+                    },
+                });
+            } else if after > before {
+                events.push(ServiceEvent::StatusChanged);
+            } else if self.pipeline.speaker.should_prompt_for_speech() {
+                self.pipeline.speaker.mark_speech_prompt_sent();
+                let prompt = self.pipeline.speaker.current_enrollment_prompt();
+                if !prompt.is_empty() {
+                    events.push(ServiceEvent::Notification {
+                        title: "Voice Enrollment".into(),
+                        message: prompt.into(),
+                        urgency: "normal".into(),
+                    });
+                    events.push(ServiceEvent::StatusChanged);
+                }
+            }
+
+            if self.pipeline.speaker.enrollment_progress() >= 3 {
+                let ok = self.pipeline.speaker.finish_enrollment();
+                events.push(ServiceEvent::StatusChanged);
+                if !ok {
+                    events.push(ServiceEvent::Error {
+                        message: "Enrollment Error".into(),
+                        details: "Could not build voice profile — speak louder and try again"
+                            .into(),
+                    });
+                }
+            }
+        }
+
+        events
+    }
 }
 
 impl ServiceCore {
@@ -81,29 +189,59 @@ impl ServiceCore {
         let config = load_config().unwrap_or_default();
         let models_path = ModelPaths::from_home();
         let executor = Arc::new(CommandExecutor::new());
-        let resolver = CommandIntentResolver::new(CommandExecutor::new());
+        let resolver = CommandIntentResolver::new(executor.clone());
         let tts = Arc::new(TtsEngine::new());
+        let command_executed_cb: Arc<Mutex<Option<Arc<dyn Fn(String, String, f64) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+        let cb_slot = command_executed_cb.clone();
+        let worker = CommandWorker::new(
+            executor,
+            tts.clone(),
+            Arc::new(move |command, phrase, confidence| {
+                if let Some(cb) = cb_slot.lock().unwrap().as_ref() {
+                    cb(command, phrase, confidence);
+                }
+            }),
+        );
         let mut pipeline = SpeechPipeline::new(models_path, resolver);
+        let mut init_errors = Vec::new();
         if let Err(e) = pipeline.initialize(&config) {
+            init_errors.push(format!("Pipeline init: {e}"));
             error!("Pipeline init: {e}");
         }
+        if let Some(err) = pipeline.init_error() {
+            init_errors.push(err.to_string());
+        }
 
-        let mut mode_machine = ModeStateMachine::new(executor, tts);
-        mode_machine.apply_config(&config);
-        pipeline.set_mode(Mode::Normal);
-
-        Ok(Self {
+        let core = Self {
             inner: Arc::new(Mutex::new(ServiceInner {
-                config,
+                config: config.clone(),
                 pipeline,
-                mode_machine,
+                mode_machine: ModeStateMachine::new(worker, tts),
                 listening_desired: true,
                 audio_active: false,
                 is_running: false,
             })),
             event_cb: Mutex::new(None),
             audio_thread: Mutex::new(None),
-        })
+            audio_stop: Mutex::new(None),
+            command_executed_cb,
+        };
+
+        {
+            let mut st = core.inner.lock().unwrap();
+            st.mode_machine.apply_config(&config);
+            st.pipeline.set_mode(Mode::Normal);
+        }
+
+        if !init_errors.is_empty() {
+            core.emit(ServiceEvent::Error {
+                message: "Initialization Warning".into(),
+                details: init_errors.join("; "),
+            });
+        }
+
+        Ok(core)
     }
 
     pub fn set_event_callback(&self, cb: EventCallback) {
@@ -168,19 +306,35 @@ impl ServiceCore {
         );
         map.insert(
             "models_loaded".into(),
-            zvariant::OwnedValue::from(st.pipeline.is_ready()),
+            zvariant::OwnedValue::from(st.pipeline.ready_for_command()),
+        );
+        map.insert(
+            "kws_ready".into(),
+            zvariant::OwnedValue::from(st.pipeline.kws_ready()),
+        );
+        map.insert(
+            "asr_ready".into(),
+            zvariant::OwnedValue::from(st.pipeline.asr_ready()),
         );
         map.insert(
             "whisper_loaded".into(),
-            zvariant::OwnedValue::from(st.pipeline.is_ready()),
+            zvariant::OwnedValue::from(st.pipeline.ready_for_command()),
         );
         map.insert(
             "kws_active".into(),
             zvariant::OwnedValue::from(st.pipeline.kws.is_loaded()),
         );
         map.insert(
+            "speaker_verification_enabled".into(),
+            zvariant::OwnedValue::from(st.config.speaker_verification.enabled),
+        );
+        map.insert(
             "speaker_enrolled".into(),
             zvariant::OwnedValue::from(st.pipeline.speaker.is_enrolled()),
+        );
+        map.insert(
+            "enrollment_prompt".into(),
+            dbus_str(st.pipeline.speaker.current_enrollment_prompt()),
         );
         map.insert("hotword".into(), dbus_str(&st.config.hotword));
         map.insert(
@@ -202,6 +356,24 @@ impl ServiceCore {
         map.insert(
             "keyword_encoding_ready".into(),
             zvariant::OwnedValue::from(keyword_encoding_available()),
+        );
+        map.insert(
+            "kws_keywords_source".into(),
+            dbus_str(st.pipeline.keywords_source().as_str()),
+        );
+        map.insert(
+            "init_error".into(),
+            dbus_str(st.pipeline.init_error().unwrap_or("")),
+        );
+        map.insert(
+            "speaker_verification_last_result".into(),
+            zvariant::OwnedValue::from(
+                st.pipeline
+                    .speaker
+                    .last_verify_result()
+                    .map(|b| if b { 1i32 } else { 0 })
+                    .unwrap_or(-1),
+            ),
         );
         map.insert(
             "streaming_active".into(),
@@ -240,11 +412,6 @@ impl ServiceCore {
                 st.config.hotword = hotword.clone();
                 let cfg = st.config.clone();
                 st.pipeline.apply_config(&cfg)?;
-                self.emit(ServiceEvent::Notification {
-                    title: "Hotword Updated".into(),
-                    message: format!("Now listening for: {hotword}"),
-                    urgency: "normal".into(),
-                });
             }
             "command_threshold" => {
                 let mut threshold: f64 = value.try_into()?;
@@ -298,10 +465,17 @@ impl ServiceCore {
     }
 
     pub fn start(&self) -> Result<()> {
-        if !self.inner.lock().unwrap().pipeline.is_ready() {
+        if !self.inner.lock().unwrap().pipeline.ready_for_normal() {
+            let err = {
+                let st = self.inner.lock().unwrap();
+                st.pipeline
+                    .init_error()
+                    .unwrap_or("KWS model not loaded")
+                    .to_string()
+            };
             self.emit(ServiceEvent::Error {
                 message: "Start Error".into(),
-                details: "Speech models not loaded".into(),
+                details: err,
             });
             return Ok(());
         }
@@ -319,14 +493,12 @@ impl ServiceCore {
             st.is_running = false;
             st.audio_active = false;
         }
+        if let Some(stop) = self.audio_stop.lock().unwrap().take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(handle) = self.audio_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
-        self.emit(ServiceEvent::Notification {
-            title: "Voice Assistant".into(),
-            message: "Service stopped".into(),
-            urgency: "normal".into(),
-        });
         self.emit(ServiceEvent::StatusChanged);
     }
 
@@ -346,49 +518,51 @@ impl ServiceCore {
     }
 
     pub fn start_speaker_enrollment(&self) -> Result<()> {
-        if !self.inner.lock().unwrap().pipeline.is_ready() {
+        if !self.inner.lock().unwrap().config.speaker_verification.enabled {
             self.emit(ServiceEvent::Error {
                 message: "Enrollment Error".into(),
-                details: "Speech models are not loaded".into(),
+                details: "Speaker verification is disabled — set speaker_verification.enabled to true in config.json"
+                    .into(),
+            });
+            return Ok(());
+        }
+
+        if !self.inner.lock().unwrap().pipeline.ready_for_normal() {
+            self.emit(ServiceEvent::Error {
+                message: "Enrollment Error".into(),
+                details: "KWS model is not loaded".into(),
             });
             return Ok(());
         }
         self.try_start_listening()?;
-        let reenroll;
         {
             let mut st = self.inner.lock().unwrap();
             if st.pipeline.speaker.enrollment_state() == EnrollmentState::Recording {
-                self.emit(ServiceEvent::Notification {
-                    title: "Voice Enrollment".into(),
-                    message: "Enrollment is already in progress".into(),
-                    urgency: "low".into(),
-                });
                 return Ok(());
             }
-            reenroll = st.pipeline.speaker.is_enrolled();
             let user = st.config.speaker_verification.enrolled_user.clone();
             st.pipeline.speaker.start_enrollment(&user);
         }
-        self.emit(ServiceEvent::Notification {
-            title: "Voice Enrollment".into(),
-            message: if reenroll {
-                "Re-enrollment started — speak clearly for about 6 seconds total".into()
-            } else {
-                "Speak naturally — Willow will capture 3 short samples (~2 seconds each)".into()
-            },
-            urgency: "normal".into(),
-        });
         self.emit(ServiceEvent::StatusChanged);
+        let prompt = self
+            .inner
+            .lock()
+            .unwrap()
+            .pipeline
+            .speaker
+            .current_enrollment_prompt();
+        if !prompt.is_empty() {
+            self.emit(ServiceEvent::Notification {
+                title: "Voice Enrollment".into(),
+                message: prompt.into(),
+                urgency: "normal".into(),
+            });
+        }
         Ok(())
     }
 
     pub fn cancel_speaker_enrollment(&self) {
         self.inner.lock().unwrap().pipeline.speaker.cancel_enrollment();
-        self.emit(ServiceEvent::Notification {
-            title: "Voice Enrollment".into(),
-            message: "Enrollment cancelled".into(),
-            urgency: "low".into(),
-        });
         self.emit(ServiceEvent::StatusChanged);
     }
 
@@ -415,7 +589,7 @@ impl ServiceCore {
     pub fn auto_start(&self) {
         let should = {
             let st = self.inner.lock().unwrap();
-            st.listening_desired && st.pipeline.is_ready() && !st.audio_active
+            st.listening_desired && st.pipeline.ready_for_normal() && !st.audio_active
         };
         if should {
             let _ = self.try_start_listening();
@@ -426,15 +600,16 @@ impl ServiceCore {
         if self.inner.lock().unwrap().audio_active {
             return Ok(());
         }
-        if !self.inner.lock().unwrap().pipeline.is_ready() {
+        if !self.inner.lock().unwrap().pipeline.ready_for_normal() {
             return Ok(());
         }
 
         if self.audio_thread.lock().unwrap().is_some() {
-            let mut st = self.inner.lock().unwrap();
-            st.audio_active = true;
-            st.is_running = true;
-            drop(st);
+            {
+                let mut st = self.inner.lock().unwrap();
+                st.audio_active = true;
+                st.is_running = true;
+            }
             self.emit(ServiceEvent::StatusChanged);
             return Ok(());
         }
@@ -455,199 +630,37 @@ impl ServiceCore {
 
         let inner = self.inner.clone();
         let tx_audio = tx.clone();
-        let handle = MicCapture::start(move |chunk| {
-            let mut events = Vec::new();
-            {
+        let (handle, stop) = MicCapture::start(move |chunk| {
+            let events = {
                 let mut st = inner.lock().unwrap();
-                st.pipeline.process_audio(chunk);
-
-                if st.pipeline.speaker.enrollment_state() == EnrollmentState::Recording {
-                    let before = st.pipeline.speaker.enrollment_progress();
-                    let state_before = st.pipeline.speaker.enrollment_state();
-                    st.pipeline.speaker.add_enrollment_audio(chunk);
-                    let after = st.pipeline.speaker.enrollment_progress();
-                    let state_after = st.pipeline.speaker.enrollment_state();
-
-                    if state_before == EnrollmentState::Recording
-                        && state_after == EnrollmentState::Failed
-                        && after < 3
-                    {
-                        events.push(ServiceEvent::Error {
-                            message: "Enrollment Error".into(),
-                            details: if after == 0 {
-                                "Enrollment timed out — speak steadily right after pressing Start"
-                                    .into()
-                            } else {
-                                "Enrollment failed — speak louder and try again".into()
-                            },
-                        });
-                    } else if after > before {
-                        events.push(ServiceEvent::Notification {
-                            title: "Voice Enrollment".into(),
-                            message: format!("Sample {after} of 3 captured"),
-                            urgency: "normal".into(),
-                        });
-                        events.push(ServiceEvent::StatusChanged);
-                    } else if st.pipeline.speaker.should_prompt_for_speech() {
-                        let sample = st.pipeline.speaker.enrollment_progress();
-                        events.push(ServiceEvent::Notification {
-                            title: "Voice Enrollment".into(),
-                            message: if sample == 0 {
-                                "Enrollment listening — start speaking now".into()
-                            } else {
-                                format!("Keep speaking — sample {} of 3", sample + 1)
-                            },
-                            urgency: "low".into(),
-                        });
-                        st.pipeline.speaker.mark_speech_prompt_sent();
-                    }
-
-                    if st.pipeline.speaker.enrollment_progress() >= 3 {
-                        let ok = st.pipeline.speaker.finish_enrollment();
-                        events.push(ServiceEvent::StatusChanged);
-                        events.push(if ok {
-                            ServiceEvent::Notification {
-                                title: "Voice Enrollment".into(),
-                                message: "Voice profile enrolled successfully".into(),
-                                urgency: "normal".into(),
-                            }
-                        } else {
-                            ServiceEvent::Error {
-                                message: "Enrollment Error".into(),
-                                details:
-                                    "Could not build voice profile — speak louder and try again"
-                                        .into(),
-                            }
-                        });
-                    }
-                }
-            }
+                st.process_audio_chunk(chunk)
+            };
             for ev in events {
                 let _ = tx_audio.send(ev);
             }
         })?;
 
         *self.audio_thread.lock().unwrap() = Some(handle);
+        *self.audio_stop.lock().unwrap() = Some(stop);
 
-        let mut st = self.inner.lock().unwrap();
-        st.audio_active = true;
-        st.is_running = true;
-        drop(st);
-
-        self.emit(ServiceEvent::Notification {
-            title: "Voice Assistant".into(),
-            message: "Service started".into(),
-            urgency: "normal".into(),
-        });
+        {
+            let mut st = self.inner.lock().unwrap();
+            st.audio_active = true;
+            st.is_running = true;
+        }
         self.emit(ServiceEvent::StatusChanged);
+
         Ok(())
     }
 
     fn setup_callbacks(&self, tx: std::sync::mpsc::Sender<ServiceEvent>) -> Result<()> {
-        let inner = self.inner.clone();
-
-        {
-            let mut st = inner.lock().unwrap();
-            let tx_cmd = tx.clone();
-            st.mode_machine.set_command_executed_callback(move |command, phrase, confidence| {
-                let _ = tx_cmd.send(ServiceEvent::CommandExecuted {
-                    command,
-                    phrase,
-                    confidence,
-                });
+        *self.command_executed_cb.lock().unwrap() = Some(Arc::new(move |command, phrase, confidence| {
+            let _ = tx.send(ServiceEvent::CommandExecuted {
+                command,
+                phrase,
+                confidence,
             });
-        }
-
-        {
-            let mut st = inner.lock().unwrap();
-            st.pipeline.set_action_callback({
-                let inner = inner.clone();
-                let tx = tx.clone();
-                move |keyword| {
-                    if let Some(change) = inner.lock().unwrap().handle_keyword(keyword) {
-                        let _ = tx.send(ServiceEvent::ModeChanged {
-                            new_mode: change.new_mode.as_str().to_string(),
-                            old_mode: change.old_mode.as_str().to_string(),
-                        });
-                    }
-                    let _ = tx.send(ServiceEvent::StatusChanged);
-                }
-            });
-        }
-
-        {
-            let st = inner.lock().unwrap();
-            st.pipeline.kws.set_callback({
-                let inner = inner.clone();
-                let tx = tx.clone();
-                move |keyword| {
-                    let mut st = inner.lock().unwrap();
-                    st.pipeline.on_keyword_detected(keyword);
-                    drop(st);
-                    let _ = tx.send(ServiceEvent::StatusChanged);
-                }
-            });
-        }
-
-        {
-            let mut st = inner.lock().unwrap();
-            st.pipeline.set_transcription_callback({
-                let inner = inner.clone();
-                let tx = tx.clone();
-                move |result: TranscriptionResult| {
-                    let mut events = Vec::new();
-                    {
-                        let mut st = inner.lock().unwrap();
-                        st.pipeline.on_transcription_result(result.clone());
-                    }
-
-                    events.push(ServiceEvent::PartialBufferChanged {
-                        partial: result.text.clone(),
-                        is_final: result.is_final,
-                    });
-                    {
-                        let st = inner.lock().unwrap();
-                        if matches!(st.mode_machine.mode(), Mode::Command | Mode::Typing)
-                            && !result.text.is_empty()
-                        {
-                            events.push(ServiceEvent::BufferChanged(result.text.clone()));
-                        }
-                    }
-
-                    if let Some(change) = inner.lock().unwrap().handle_transcription(&result) {
-                        events.push(ServiceEvent::ModeChanged {
-                            new_mode: change.new_mode.as_str().to_string(),
-                            old_mode: change.old_mode.as_str().to_string(),
-                        });
-                    }
-                    events.push(ServiceEvent::StatusChanged);
-                    for ev in events {
-                        let _ = tx.send(ev);
-                    }
-                }
-            });
-        }
-
-        {
-            let mut st = inner.lock().unwrap();
-            st.pipeline.set_speaker_fail_callback({
-                let tx = tx.clone();
-                move |reason| {
-                    let _ = tx.send(ServiceEvent::SpeakerVerificationFailed(reason));
-                }
-            });
-        }
-
-        {
-            let mut st = inner.lock().unwrap();
-            st.pipeline.set_command_pending_callback({
-                let tx = tx.clone();
-                move |phrase, blocked| {
-                    let _ = tx.send(ServiceEvent::CommandPending { phrase, blocked });
-                }
-            });
-        }
-
+        }));
         Ok(())
     }
 }

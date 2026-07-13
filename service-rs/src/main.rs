@@ -35,9 +35,11 @@ async fn main() -> Result<()> {
     let dbus_service = WillowDBus::new(core.clone());
 
     let dbus_for_events = dbus_service.clone();
+    let runtime = tokio::runtime::Handle::current();
     core.set_event_callback(Arc::new(move |event| {
         let dbus = dbus_for_events.clone();
-        tokio::spawn(async move {
+        // Event relay runs on a std thread; spawn onto the Tokio runtime explicitly.
+        runtime.spawn(async move {
             dbus.handle_event(event).await;
         });
     }));

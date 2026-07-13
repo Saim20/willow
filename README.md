@@ -96,8 +96,8 @@ willow-download-model && systemctl --user restart willow.service
 ```
 
 **Common issues:**
-- **Hotword not working** — hotword must match config (`hey willow` by default); re-sync in Preferences
-- **Speaker verify fails** — re-enroll in Preferences → Voice tab
+- **Hotword not working** — hotword must match config (`hey willow` by default); check D-Bus status fields `kws_ready`, `kws_keywords_source`, and `init_error`. To isolate speaker verification, set `speaker_verification.enabled` to `false` in `~/.config/willow/config.json`
+- **Speaker verify fails** — re-enroll in Preferences → Voice tab; you'll hear "Voice not recognized" on failure. Status field `speaker_verification_last_result` shows the last attempt (1=pass, 0=fail, -1=none)
 - **Typing does nothing** — check ydotool service and `input` group membership
 - **Search won't open browser** — service needs a graphical session (`WAYLAND_DISPLAY`/`DISPLAY`)
 

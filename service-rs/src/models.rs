@@ -27,10 +27,6 @@ impl ModelPaths {
         Self::new(home.join(".local/share/willow/models"))
     }
 
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
-    }
-
     pub fn find_kws_model(&self) -> Option<TransducerModelFiles> {
         let dir = self.find_first_dir(&["kws", "kws-zipformer-en"])?;
         self.find_transducer_in_dir(&dir)
@@ -62,18 +58,6 @@ impl ModelPaths {
             }
         }
         None
-    }
-
-    pub fn kws_keywords_path(&self) -> PathBuf {
-        for candidate in [
-            self.base_path.join("kws/keywords.txt"),
-            self.base_path.join("keywords.txt"),
-        ] {
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-        self.base_path.join("kws/keywords.txt")
     }
 
     pub fn speaker_profile_path(&self) -> PathBuf {
@@ -131,19 +115,41 @@ impl ModelPaths {
 }
 
 pub fn keyword_encoding_available() -> bool {
-    for candidate in [
-        "/usr/share/willow/scripts/generate-keywords.py",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/generate-keywords.py"),
-    ] {
-        if Path::new(candidate).is_file() {
-            return std::process::Command::new("python3")
-                .args(["-c", "import sentencepiece"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-        }
+    find_keyword_script().is_some_and(|script| {
+        std::process::Command::new("python3")
+            .args(["-c", "import sentencepiece"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && script.is_file()
+    })
+}
+
+fn keyword_script_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(root) = std::env::var("WILLOW_SOURCE_ROOT") {
+        candidates.push(std::path::PathBuf::from(root).join("scripts/generate-keywords.py"));
     }
-    false
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(
+            home.join(".local/share/willow/scripts/generate-keywords.py"),
+        );
+    }
+    candidates.push(std::path::PathBuf::from(
+        "/usr/share/willow/scripts/generate-keywords.py",
+    ));
+    let build_tree = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scripts/generate-keywords.py"
+    ));
+    candidates.push(build_tree);
+    candidates
+}
+
+fn find_keyword_script() -> Option<std::path::PathBuf> {
+    keyword_script_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
 }
 
 pub fn encode_keywords(
@@ -152,15 +158,7 @@ pub fn encode_keywords(
     output: &Path,
     phrases: &[String],
 ) -> Result<()> {
-    let script = [
-        "/usr/share/willow/scripts/generate-keywords.py",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/generate-keywords.py"),
-    ]
-    .into_iter()
-    .find(|p| Path::new(p).is_file())
-    .map(|s| s.to_string());
-
-    let script = script.ok_or_else(|| anyhow::anyhow!("generate-keywords.py not found"))?;
+    let script = find_keyword_script().ok_or_else(|| anyhow::anyhow!("generate-keywords.py not found"))?;
 
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -179,7 +177,7 @@ pub fn encode_keywords(
     std::fs::write(&input_path, input)?;
 
     let status = std::process::Command::new("python3")
-        .arg(&script)
+        .arg(script.as_os_str())
         .args(["--tokens", tokens])
         .args(["--bpe-model", bpe_model])
         .args(["--input", &input_path.to_string_lossy()])
@@ -189,12 +187,19 @@ pub fn encode_keywords(
     if !status.success() {
         bail!("keyword encoding failed");
     }
+    if !keywords_look_encoded(output) {
+        bail!("keyword encoding produced invalid output (missing @TAG aliases)");
+    }
     Ok(())
 }
 
 pub fn keywords_look_encoded(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|s| s.lines().next().map(|l| l.to_string()))
-        .is_some_and(|l| l.contains('▁'))
+        .is_some_and(|s| {
+            s.lines().any(|line| {
+                let line = line.trim();
+                !line.is_empty() && line.contains('▁') && line.contains('@')
+            })
+        })
 }

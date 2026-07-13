@@ -4,17 +4,13 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")" && pwd)"
 ext_src="$repo_root/gnome-extension/willow@saim"
 ext_dest="$HOME/.local/share/gnome-shell/extensions/willow@saim"
-service_bin="$repo_root/service-rs/target/release/willow-service"
 
+echo "→ Building willow-service (release)" >&2
 cargo build --release --manifest-path "$repo_root/service-rs/Cargo.toml"
 
-if [[ ! -f "$service_bin" ]]; then
-    printf 'ERROR: %s not found after build.\n' "$service_bin"
-    exit 1
-fi
+bash "$repo_root/scripts/install-service-dev.sh"
 
-sudo install -Dm755 "$service_bin" /usr/bin/willow-service
-
+echo "→ Linking GNOME extension" >&2
 mkdir -p "$(dirname "$ext_dest")"
 if [[ -L "$ext_dest" ]]; then
     :
@@ -24,15 +20,14 @@ else
     ln -s "$ext_src" "$ext_dest"
 fi
 
+echo "→ Compiling GSettings schemas" >&2
 glib-compile-schemas "$ext_src/schemas/"
 
 if [[ ! -f "$ext_src/schemas/gschemas.compiled" ]]; then
-    printf 'ERROR: gschemas.compiled was not generated\n'
+    echo "ERROR: gschemas.compiled was not generated" >&2
     exit 1
 fi
 
-systemctl --user restart willow.service
-
-printf '\nDev install complete.\n'
-printf 'Restart GNOME Shell (Alt+F2, type r, Enter), then run:\n'
-printf '  gnome-extensions enable willow@saim\n'
+echo "" >&2
+echo "Dev install complete." >&2
+echo "Enable extension: gnome-extensions enable willow@saim" >&2

@@ -9,6 +9,7 @@ PartOf=graphical-session.target
 Type=dbus
 BusName=com.github.saim.Willow
 ExecStart=/usr/bin/willow-service
+TimeoutStopSec=15
 Restart=on-failure
 RestartSec=5
 

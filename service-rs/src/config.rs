@@ -70,21 +70,21 @@ impl Default for WillowConfig {
             hotword: "hey willow".into(),
             command_threshold: 80.0,
             speaker_verification: SpeakerConfig {
-                enabled: true,
+                enabled: false,
                 threshold: 0.65,
                 enrolled_user: "owner".into(),
             },
             kws: KwsConfig { threshold: 0.25 },
             streaming_asr: StreamingConfig {
                 endpoint_silence_command: 0.3,
-                endpoint_silence_typing: 0.35,
+                endpoint_silence_typing: 0.45,
             },
             command_mode: CommandModeConfig {
                 endpoint_silence: 0.3,
             },
             typing_mode: TypingModeConfig {
-                realtime: true,
-                max_backspace: 20,
+                realtime: false,
+                max_backspace: 80,
                 check_recent_chars: 100,
                 exit_phrases: vec![
                     "stop typing".into(),
@@ -94,12 +94,12 @@ impl Default for WillowConfig {
                 ],
             },
             tts: TtsSection {
-                enabled: true,
+                enabled: false,
                 events: TtsEvents {
-                    command_executed: true,
-                    mode_changed: true,
-                    search_executed: true,
-                    errors: true,
+                    command_executed: false,
+                    mode_changed: false,
+                    search_executed: false,
+                    errors: false,
                 },
             },
             commands: default_commands(),
@@ -195,6 +195,8 @@ fn default_commands() -> Vec<Command> {
         {"name": "Firefox", "command": "firefox", "phrases": ["open firefox", "launch firefox", "start web browser"]},
         {"name": "Copy", "command": "ydotool key 29:1 46:1 46:0 29:0", "phrases": ["copy", "copy text"]},
         {"name": "Paste", "command": "ydotool key 29:1 47:1 47:0 29:0", "phrases": ["paste", "paste text"]},
+        {"name": "Move Left Workspace", "command": "ydotool key 125:1 42:1 30:1 30:0 42:0 125:0", "phrases": ["move left", "go left", "left desktop"]},
+        {"name": "Move Right Workspace", "command": "ydotool key 125:1 42:1 32:1 32:0 42:0 125:0", "phrases": ["move right", "go right", "right desktop"]},
         {"name": "Exit Command Mode", "command": "exit_command_mode", "phrases": ["exit", "cancel", "stop listening", "normal mode", "go back"]},
         {"name": "Start Typing Mode", "command": "start_typing_mode", "phrases": ["start typing", "typing mode", "begin typing", "dictation mode", "start dictation"]}
     ]))

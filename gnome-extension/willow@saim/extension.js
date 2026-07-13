@@ -44,6 +44,8 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         this._enrollmentSamples = 0;
         this._enrollmentBufferFraction = 0;
         this._enrollmentReenrolling = false;
+        this._speakerVerificationEnabled = false;
+        this._enrollmentPrompt = '';
         this._activeHotword = '';
         this._audioActive = false;
         this._autoStartAttempted = false;
@@ -229,6 +231,9 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
+        this._speakerSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._speakerSeparator);
+
         this._speakerStatusItem = new PopupMenu.PopupMenuItem('Voice: Not enrolled', {
             reactive: false
         });
@@ -238,6 +243,7 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         this._enrollItem.connect('activate', () => this._startSpeakerEnrollment());
         this.menu.addMenuItem(this._enrollItem);
 
+        this._updateSpeakerVerificationVisibility();
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         
         this._prefsItem = new PopupMenu.PopupMenuItem('Preferences');
@@ -336,6 +342,19 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
             });
         } catch (e) {
             console.error('Willow: Restart exception:', e);
+        }
+    }
+
+    _updateSpeakerVerificationVisibility() {
+        const visible = this._speakerVerificationEnabled;
+        if (this._speakerSeparator) {
+            this._speakerSeparator.visible = visible;
+        }
+        if (this._speakerStatusItem) {
+            this._speakerStatusItem.visible = visible;
+        }
+        if (this._enrollItem) {
+            this._enrollItem.visible = visible;
         }
     }
 
@@ -439,6 +458,12 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         }
         if (status.enrollment_reenrolling !== undefined) {
             this._enrollmentReenrolling = status.enrollment_reenrolling.unpack();
+        }
+        if (status.speaker_verification_enabled !== undefined) {
+            this._speakerVerificationEnabled = status.speaker_verification_enabled.unpack();
+        }
+        if (status.enrollment_prompt !== undefined) {
+            this._enrollmentPrompt = status.enrollment_prompt.unpack();
         }
         if (status.hotword !== undefined) {
             this._activeHotword = status.hotword.unpack();
@@ -551,13 +576,18 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         if (this._stopItem) this._stopItem.setSensitive(this._audioActive);
         if (this._restartItem) this._restartItem.setSensitive(this._modelsLoaded);
 
-        if (this._speakerStatusItem) {
+        this._updateSpeakerVerificationVisibility();
+
+        if (this._speakerStatusItem && this._speakerVerificationEnabled) {
             if (this._enrollmentState === 'recording') {
                 const next = this._enrollmentSamples + 1;
                 const within = Math.round(Math.min(this._enrollmentBufferFraction, 1) * 100);
                 this._speakerStatusItem.label.text = this._enrollmentReenrolling
                     ? `Voice: Re-enrolling ${next}/3 (${within}%)`
                     : `Voice: Enrolling ${next}/3 (${within}%)`;
+                if (this._enrollmentPrompt) {
+                    this._speakerStatusItem.label.text += ` — ${this._enrollmentPrompt}`;
+                }
             } else if (this._speakerEnrolled) {
                 this._speakerStatusItem.label.text = 'Voice: Enrolled';
             } else if (this._enrollmentState === 'failed') {
@@ -566,7 +596,7 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
                 this._speakerStatusItem.label.text = 'Voice: Not enrolled';
             }
         }
-        if (this._enrollItem) {
+        if (this._enrollItem && this._speakerVerificationEnabled) {
             this._enrollItem.label.text = this._speakerEnrolled
                 ? 'Re-enroll Voice Profile'
                 : 'Enroll Voice Profile';

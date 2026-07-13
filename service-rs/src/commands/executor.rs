@@ -108,19 +108,21 @@ impl CommandExecutor {
         }
     }
 
-    pub fn execute_command(&self, command: &str) {
+    pub fn execute_command(&self, command: &str) -> bool {
         self.log("INFO", &format!("Executing command: {command}"));
         let parts: Vec<&str> = command.split_whitespace().collect();
         if parts.is_empty() {
-            return;
+            return false;
         }
         let mut args = vec!["systemd-run", "--user", "--scope", "--slice=app.slice", "--"];
         args.extend(parts);
         let status = Command::new(args[0]).args(&args[1..]).status();
         if status.as_ref().map(|s| s.success()).unwrap_or(false) {
             self.log("INFO", "Command executed successfully");
+            true
         } else {
             self.log("ERROR", &format!("Command failed: {command}"));
+            false
         }
     }
 

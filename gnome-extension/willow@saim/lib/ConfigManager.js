@@ -296,6 +296,11 @@ export class ConfigManager {
         return {
             "hotword": "hey willow",
             "command_threshold": 80,
+            "speaker_verification": {
+                "enabled": false,
+                "threshold": 0.65,
+                "enrolled_user": "owner"
+            },
             "commands": [],
             "typing_mode": {
                 "exit_phrases": [

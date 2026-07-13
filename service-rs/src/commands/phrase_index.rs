@@ -108,11 +108,92 @@ pub fn normalize_kws_keyword(text: &str) -> String {
     normalize(&result)
 }
 
+/// Match a sherpa KWS token against a plain-text phrase (hotword or command phrase).
 pub fn kws_keyword_matches(detected: &str, phrase: &str) -> bool {
     let det = normalize_kws_keyword(detected);
     let reference = normalize(phrase);
     if det.is_empty() || reference.is_empty() {
         return false;
     }
-    det == reference || det.contains(&reference) || reference.contains(&det)
+    if det == reference {
+        return true;
+    }
+    // @hey_willow → "@hey willow" after normalization; strip leading @
+    if let Some(stripped) = det.strip_prefix('@') {
+        if normalize(stripped) == reference {
+            return true;
+        }
+    }
+    // Sherpa @TAG alias for this phrase (e.g. @HEY_WILLOW).
+    let tag = phrase_to_kws_tag(phrase);
+    if !tag.is_empty() {
+        let tag_norm = normalize_kws_keyword(&tag);
+        if det == tag_norm || det.ends_with(&tag_norm) {
+            return true;
+        }
+    }
+    // Token-split detections: "HE Y WILL OW" vs "hey willow"
+    if collapse_alnum(&det) == collapse_alnum(&reference) {
+        return true;
+    }
+    if !tag.is_empty() && collapse_alnum(&det) == collapse_alnum(&tag) {
+        return true;
+    }
+    false
+}
+
+fn collapse_alnum(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Build the sherpa @TAG form from a plain phrase (matches generate-keywords.py convention).
+fn phrase_to_kws_tag(phrase: &str) -> String {
+    let norm = normalize(phrase);
+    if norm.is_empty() {
+        return String::new();
+    }
+    format!(
+        "@{}",
+        norm.replace(' ', "_").to_uppercase()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kws_matches_exact_phrase() {
+        assert!(kws_keyword_matches("hey willow", "hey willow"));
+        assert!(kws_keyword_matches("@hey_willow", "hey willow"));
+        assert!(kws_keyword_matches("HEY_WILLOW", "hey willow"));
+    }
+
+    #[test]
+    fn kws_matches_bpe_tokens() {
+        assert!(kws_keyword_matches("▁HE Y ▁WILL OW @HEY_WILLOW", "hey willow"));
+    }
+
+    #[test]
+    fn kws_matches_token_split_hotword() {
+        assert!(kws_keyword_matches("HE Y WILL OW", "hey willow"));
+        assert!(kws_keyword_matches("HEY WILLOW", "hey willow"));
+        assert!(kws_keyword_matches("@HEY_WILLOW", "hey willow"));
+    }
+
+    #[test]
+    fn kws_rejects_partial_overlap() {
+        assert!(!kws_keyword_matches("willow", "hey willow"));
+        assert!(!kws_keyword_matches("hey", "hey willow"));
+        assert!(!kws_keyword_matches("exit typing mode", "exit"));
+    }
+
+    #[test]
+    fn kws_matches_mode_phrases() {
+        assert!(kws_keyword_matches("@EXIT", "exit"));
+        assert!(kws_keyword_matches("stop typing", "stop typing"));
+    }
 }

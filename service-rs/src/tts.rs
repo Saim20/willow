@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
 
@@ -6,8 +7,7 @@ use crate::types::TtsConfig;
 
 pub struct TtsEngine {
     config: Mutex<TtsConfig>,
-    queue: Mutex<Vec<String>>,
-    use_spd: bool,
+    sender: Mutex<Option<mpsc::Sender<String>>>,
 }
 
 impl TtsEngine {
@@ -17,20 +17,26 @@ impl TtsEngine {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+
+        let (tx, rx) = mpsc::channel::<String>();
+        let worker_use_spd = use_spd;
+        thread::spawn(move || {
+            while let Ok(text) = rx.recv() {
+                if text.is_empty() {
+                    continue;
+                }
+                if worker_use_spd {
+                    let _ = Command::new("spd-say").arg(&text).status();
+                } else {
+                    let _ = Command::new("espeak").arg(&text).status();
+                }
+            }
+        });
+
         Self {
             config: Mutex::new(TtsConfig::default()),
-            queue: Mutex::new(Vec::new()),
-            use_spd,
+            sender: Mutex::new(Some(tx)),
         }
-    }
-
-    pub fn is_loaded(&self) -> bool {
-        self.use_spd
-            || Command::new("sh")
-                .args(["-c", "which espeak >/dev/null 2>&1"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
     }
 
     pub fn update_config(&self, config: TtsConfig) {
@@ -42,14 +48,14 @@ impl TtsEngine {
         if !config.enabled || text.is_empty() {
             return;
         }
-        let text = text.to_string();
-        let use_spd = self.use_spd;
-        thread::spawn(move || {
-            if use_spd {
-                let _ = Command::new("spd-say").arg(&text).status();
-            } else {
-                let _ = Command::new("espeak").arg(&text).status();
-            }
-        });
+        if let Some(tx) = self.sender.lock().unwrap().as_ref() {
+            let _ = tx.send(text.to_string());
+        }
+    }
+}
+
+impl Drop for TtsEngine {
+    fn drop(&mut self) {
+        *self.sender.lock().unwrap() = None;
     }
 }

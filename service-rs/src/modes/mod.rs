@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::commands::phrase_index::normalize;
-use crate::commands::CommandExecutor;
+use crate::commands::CommandWorker;
 use crate::config::WillowConfig;
 use crate::pipeline::SpeechPipeline;
 use crate::types::{CommandDispatchResult, Mode, TranscriptionResult, TtsConfig};
@@ -10,51 +10,32 @@ use crate::tts::TtsEngine;
 pub struct ModeStateMachine {
     mode: Mode,
     buffer: String,
-    typing_last_partial: String,
-    typing_committed: String,
-    executor: Arc<CommandExecutor>,
+    typing_last_typed: String,
+    worker: CommandWorker,
     tts: Arc<TtsEngine>,
     tts_config: TtsConfig,
     typing_realtime: bool,
     typing_max_backspace: i32,
-    typing_check_recent: i32,
     typing_exit_phrases: Vec<String>,
-    on_command_executed: Option<Arc<dyn Fn(String, String, f64) + Send + Sync>>,
 }
 
 impl ModeStateMachine {
-    pub fn new(executor: Arc<CommandExecutor>, tts: Arc<TtsEngine>) -> Self {
+    pub fn new(worker: CommandWorker, tts: Arc<TtsEngine>) -> Self {
         Self {
             mode: Mode::Normal,
             buffer: String::new(),
-            typing_last_partial: String::new(),
-            typing_committed: String::new(),
-            executor,
+            typing_last_typed: String::new(),
+            worker,
             tts,
             tts_config: TtsConfig::default(),
-            typing_realtime: true,
-            typing_max_backspace: 20,
-            typing_check_recent: 100,
+            typing_realtime: false,
+            typing_max_backspace: 80,
             typing_exit_phrases: vec![
                 "stop typing".into(),
                 "exit typing".into(),
                 "normal mode".into(),
                 "go to normal mode".into(),
             ],
-            on_command_executed: None,
-        }
-    }
-
-    pub fn set_command_executed_callback<F>(&mut self, f: F)
-    where
-        F: Fn(String, String, f64) + Send + Sync + 'static,
-    {
-        self.on_command_executed = Some(Arc::new(f));
-    }
-
-    fn notify_command_executed(&self, command: &str, phrase: &str, confidence: f64) {
-        if let Some(cb) = &self.on_command_executed {
-            cb(command.to_string(), phrase.to_string(), confidence);
         }
     }
 
@@ -62,7 +43,6 @@ impl ModeStateMachine {
         self.tts_config = config.tts_config();
         self.typing_realtime = config.typing_mode.realtime;
         self.typing_max_backspace = config.typing_mode.max_backspace;
-        self.typing_check_recent = config.typing_mode.check_recent_chars;
         self.typing_exit_phrases = config.typing_mode.exit_phrases.clone();
         self.tts.update_config(self.tts_config.clone());
     }
@@ -74,11 +54,7 @@ impl ModeStateMachine {
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.buffer.clear();
-        self.typing_last_partial.clear();
-    }
-
-    pub fn apply_mode_to_pipeline(&self, mode: Mode, pipeline: &mut SpeechPipeline) {
-        pipeline.set_mode(mode);
+        self.typing_last_typed.clear();
     }
 
     pub fn set_mode_with_pipeline(&mut self, mode: Mode, pipeline: &mut SpeechPipeline) {
@@ -97,6 +73,13 @@ impl ModeStateMachine {
     ) -> Option<ModeChange> {
         match keyword {
             "command" | "normal" | "typing" => {
+                if keyword == "command" && !pipeline.ready_for_command() {
+                    if self.tts_config.errors {
+                        self.tts
+                            .speak("Speech recognition is not available");
+                    }
+                    return None;
+                }
                 let new_mode = Mode::from_str(keyword);
                 let old = self.mode;
                 if new_mode != old {
@@ -106,13 +89,7 @@ impl ModeStateMachine {
                 }
                 None
             }
-            _ => {
-                if self.mode == Mode::Command {
-                    let dispatch = pipeline.resolver.process_keyword(keyword);
-                    self.dispatch_command(dispatch, pipeline);
-                }
-                None
-            }
+            _ => None,
         }
     }
 
@@ -137,7 +114,8 @@ impl ModeStateMachine {
                 None
             }
             Mode::Typing => {
-                if self.check_exit_phrases(&result.text) {
+                let text = format_for_typing(&result.text);
+                if self.check_exit_phrases(&text) {
                     let old = self.mode;
                     self.set_mode_with_pipeline(Mode::Normal, pipeline);
                     self.speak_mode(Mode::Normal);
@@ -147,10 +125,11 @@ impl ModeStateMachine {
                     });
                 }
                 if result.is_final || result.is_endpoint {
-                    self.process_typing_final(&result.text);
+                    self.commit_typing_phrase(&text);
+                    self.typing_last_typed.clear();
                     pipeline.asr.reset_stream();
                 } else if self.typing_realtime {
-                    self.process_typing_partial(&result.text);
+                    self.apply_typing_delta(&text);
                 }
                 None
             }
@@ -169,37 +148,32 @@ impl ModeStateMachine {
             return;
         }
 
+        if result.command_action.is_empty()
+            && !result.is_search
+            && !result.is_smart_open
+        {
+            return;
+        }
+
         if result.is_search {
-            if self
-                .executor
-                .execute_smart_search(&result.search_engine, &result.search_query)
-            {
-                if self.tts_config.search_executed {
-                    self.tts.speak(&format!(
-                        "Searching {} for {}",
-                        result.search_engine, result.search_query
-                    ));
-                }
-                self.notify_command_executed(
-                    &result.search_engine,
-                    &result.matched_phrase,
-                    result.confidence,
-                );
-            }
+            self.worker.smart_search(
+                result.search_engine,
+                result.search_query,
+                result.matched_phrase,
+                result.confidence,
+                self.tts_config.search_executed,
+            );
             return;
         }
 
         if result.is_smart_open {
-            if self.executor.execute_smart_open(&result.app_name) {
-                if self.tts_config.command_executed {
-                    self.tts.speak(&format!("Opening {}", result.app_name));
-                }
-                self.notify_command_executed(
-                    &result.app_name,
-                    &result.matched_phrase,
-                    result.confidence,
-                );
-            }
+            self.worker.smart_open(
+                result.app_name,
+                result.matched_phrase,
+                result.confidence,
+                self.tts_config.command_executed,
+                self.tts_config.errors,
+            );
             return;
         }
 
@@ -214,14 +188,12 @@ impl ModeStateMachine {
             return;
         }
 
-        self.executor.execute_command(&result.command_action);
-        if self.tts_config.command_executed {
-            self.tts.speak("Done");
-        }
-        self.notify_command_executed(
-            &result.command_action,
-            &result.matched_phrase,
+        self.worker.execute(
+            result.command_action,
+            result.matched_phrase,
             result.confidence,
+            self.tts_config.command_executed,
+            self.tts_config.errors,
         );
     }
 
@@ -231,55 +203,150 @@ impl ModeStateMachine {
         }
     }
 
+    pub fn speak_speaker_rejected(&self) {
+        if self.tts_config.errors {
+            self.tts.speak("Voice not recognized");
+        }
+    }
+
     fn check_exit_phrases(&self, text: &str) -> bool {
-        let norm = normalize(text);
         self.typing_exit_phrases.iter().any(|phrase| {
             let p = normalize(phrase);
-            norm.contains(&p)
+            text.contains(&p)
         })
     }
 
-    fn process_typing_partial(&mut self, partial: &str) {
-        self.type_delta(&self.typing_last_partial.clone(), partial);
-        self.typing_last_partial = partial.to_string();
-    }
-
-    fn process_typing_final(&mut self, final_text: &str) {
-        if !final_text.is_empty() {
-            self.type_delta(&self.typing_last_partial, final_text);
-            self.executor.type_text(" ");
-            self.typing_committed.push_str(final_text);
-            self.typing_committed.push(' ');
-        }
-        self.typing_last_partial.clear();
-    }
-
-    fn type_delta(&self, old_text: &str, new_text: &str) {
-        if new_text == old_text {
+    /// Type a completed phrase once (default typing path — no partial churn).
+    fn commit_typing_phrase(&mut self, text: &str) {
+        if text.is_empty() {
             return;
         }
-        let mut common = 0usize;
-        let min_len = old_text.len().min(new_text.len());
-        while common < min_len
-            && old_text.as_bytes().get(common) == new_text.as_bytes().get(common)
-        {
-            common += 1;
-        }
-        let to_delete = old_text.len().saturating_sub(common);
-        if to_delete > 0 {
-            let capped = to_delete.min(self.typing_max_backspace as usize);
-            for _ in 0..capped {
-                self.executor.press_key("14:1 14:0");
+        if self.typing_realtime {
+            let suffix = typing_suffix_after(&self.typing_last_typed, text);
+            if !suffix.is_empty() {
+                self.worker.type_text(&suffix);
+                self.worker.type_text(" ");
             }
-        }
-        if common < new_text.len() {
-            self.executor.type_text(&new_text[common..]);
+        } else {
+            self.worker.type_text(text);
+            self.worker.type_text(" ");
         }
     }
+
+    /// Realtime path: word-aligned diff so ASR revisions backspace correctly.
+    fn apply_typing_delta(&mut self, new_text: &str) {
+        if new_text == self.typing_last_typed {
+            return;
+        }
+        let (chars_to_delete, to_type) =
+            typing_word_delta(&self.typing_last_typed, new_text, self.typing_max_backspace);
+        for _ in 0..chars_to_delete {
+            self.worker.press_key("14:1 14:0");
+        }
+        if !to_type.is_empty() {
+            self.worker.type_text(&to_type);
+        }
+        self.typing_last_typed = new_text.to_string();
+    }
+}
+
+/// Lowercase + normalized whitespace for typed output.
+fn format_for_typing(text: &str) -> String {
+    normalize(text)
+}
+
+/// Characters to backspace and text to type after a word-aligned diff.
+fn typing_word_delta(old: &str, new: &str, max_backspace: i32) -> (usize, String) {
+    if new.is_empty() {
+        return (0, String::new());
+    }
+    if old.is_empty() {
+        return (0, new.to_string());
+    }
+
+    let old_words: Vec<&str> = old.split_whitespace().collect();
+    let new_words: Vec<&str> = new.split_whitespace().collect();
+
+    let mut shared = 0usize;
+    while shared < old_words.len()
+        && shared < new_words.len()
+        && old_words[shared] == new_words[shared]
+    {
+        shared += 1;
+    }
+
+    let deleted_words = &old_words[shared..];
+    let chars_to_delete: usize = if deleted_words.is_empty() {
+        0
+    } else {
+        deleted_words.join(" ").len() + 1
+    };
+    let capped = chars_to_delete.min(max_backspace.max(0) as usize);
+
+    let to_type = if shared < new_words.len() {
+        let mut suffix = new_words[shared..].join(" ");
+        if shared > 0 && !suffix.is_empty() {
+            suffix.insert(0, ' ');
+        }
+        suffix
+    } else {
+        String::new()
+    };
+
+    (capped, to_type)
+}
+
+/// Suffix of `new` not already covered by `old` when both describe the same utterance.
+fn typing_suffix_after(old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return new.to_string();
+    }
+    if new.starts_with(old) {
+        let rest = new[old.len()..].trim_start();
+        return rest.to_string();
+    }
+    if old.starts_with(new) {
+        return String::new();
+    }
+    let (chars_to_delete, to_type) = typing_word_delta(old, new, i32::MAX);
+    let _ = chars_to_delete;
+    to_type.trim_start().to_string()
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModeChange {
     pub new_mode: Mode,
     pub old_mode: Mode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_for_typing_lowercases() {
+        assert_eq!(format_for_typing("  HELLO   WORLD  "), "hello world");
+    }
+
+    #[test]
+    fn word_delta_extends_prefix() {
+        let (del, typed) = typing_word_delta("hello wor", "hello world", 80);
+        assert_eq!(del, 4);
+        assert_eq!(typed, " world");
+    }
+
+    #[test]
+    fn word_delta_revises_middle_word() {
+        let (del, typed) = typing_word_delta("the quick brown", "the fast brown", 80);
+        assert_eq!(del, 12);
+        assert_eq!(typed, " fast brown");
+    }
+
+    #[test]
+    fn commit_suffix_after_partial() {
+        assert_eq!(
+            typing_suffix_after("hello wor", "hello world"),
+            "ld"
+        );
+    }
 }

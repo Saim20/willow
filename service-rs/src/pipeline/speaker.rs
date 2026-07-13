@@ -16,6 +16,13 @@ const SAMPLE_LEN: usize = 16000 * 2;
 const MIN_RMS: f32 = 0.008;
 const TIMEOUT: Duration = Duration::from_secs(90);
 const HINT_INTERVAL: Duration = Duration::from_secs(8);
+const VERIFY_COOLDOWN: Duration = Duration::from_secs(3);
+
+const ENROLLMENT_PROMPTS: [&str; 3] = [
+    "Sample 1/3 — try: \"hey willow, open terminal\"",
+    "Sample 2/3 — try: \"what time is it today\"",
+    "Sample 3/3 — say anything else in your normal voice",
+];
 
 pub struct SpeakerVerifier {
     extractor: Option<SpeakerEmbeddingExtractor>,
@@ -33,6 +40,8 @@ pub struct SpeakerVerifier {
     started_at: Option<Instant>,
     last_speech_at: Option<Instant>,
     last_hint_at: Option<Instant>,
+    verify_cooldown_until: Option<Instant>,
+    last_verify_passed: Option<bool>,
 }
 
 impl SpeakerVerifier {
@@ -53,6 +62,8 @@ impl SpeakerVerifier {
             started_at: None,
             last_speech_at: None,
             last_hint_at: None,
+            verify_cooldown_until: None,
+            last_verify_passed: None,
         }
     }
 
@@ -62,7 +73,7 @@ impl SpeakerVerifier {
             .context("speaker model not found")?;
         let config = SpeakerEmbeddingExtractorConfig {
             model: Some(model),
-            num_threads: 2,
+            num_threads: 1,
             debug: false,
             provider: Some("cpu".into()),
         };
@@ -75,10 +86,6 @@ impl SpeakerVerifier {
         self.load_profile()?;
         info!("Speaker verifier initialized");
         Ok(())
-    }
-
-    pub fn is_loaded(&self) -> bool {
-        self.extractor.is_some()
     }
 
     pub fn is_enrolled(&self) -> bool {
@@ -118,6 +125,33 @@ impl SpeakerVerifier {
 
     pub fn is_reenrolling(&self) -> bool {
         self.reenrolling
+    }
+
+    pub fn current_enrollment_prompt(&self) -> &'static str {
+        if self.state != EnrollmentState::Recording {
+            return "";
+        }
+        let idx = self.samples.len().min(ENROLLMENT_PROMPTS.len() - 1);
+        ENROLLMENT_PROMPTS[idx]
+    }
+
+    pub fn in_verify_cooldown(&self) -> bool {
+        self.verify_cooldown_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    pub fn last_verify_result(&self) -> Option<bool> {
+        self.last_verify_passed
+    }
+
+    pub fn record_verify_pass(&mut self) {
+        self.last_verify_passed = Some(true);
+        self.verify_cooldown_until = None;
+    }
+
+    pub fn record_verify_fail(&mut self) {
+        self.last_verify_passed = Some(false);
+        self.verify_cooldown_until = Some(Instant::now() + VERIFY_COOLDOWN);
     }
 
     pub fn start_enrollment(&mut self, user: &str) {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -9,21 +10,26 @@ use super::phrase_index::{normalize, CommandPhraseIndex};
 use crate::types::{Command, CommandDispatchResult};
 
 pub struct CommandIntentResolver {
-    executor: CommandExecutor,
+    executor: Arc<CommandExecutor>,
     phrase_index: CommandPhraseIndex,
     commands: Vec<Command>,
     threshold: f64,
     history: Mutex<Vec<(String, Instant)>>,
+    search_re_for: Regex,
+    search_re_short: Regex,
 }
 
 impl CommandIntentResolver {
-    pub fn new(executor: CommandExecutor) -> Self {
+    pub fn new(executor: Arc<CommandExecutor>) -> Self {
         Self {
             executor,
             phrase_index: CommandPhraseIndex::new(),
             commands: Vec::new(),
             threshold: 0.8,
             history: Mutex::new(Vec::new()),
+            search_re_for: Regex::new(r"search\s+(\w+)\s+for\s+(.+)")
+                .expect("valid search regex"),
+            search_re_short: Regex::new(r"search\s+(\w+)\s+(.+)").expect("valid search regex"),
         }
     }
 
@@ -34,24 +40,6 @@ impl CommandIntentResolver {
 
     pub fn set_threshold(&mut self, threshold: f64) {
         self.threshold = threshold;
-    }
-
-    pub fn process_keyword(&self, keyword: &str) -> CommandDispatchResult {
-        let norm = normalize(keyword);
-        let lookup = self.phrase_index.lookup(&norm);
-        if lookup.exact_match && !lookup.blocked_by_prefix {
-            if let Some(m) = lookup.matches.first() {
-                return CommandDispatchResult {
-                    handled: true,
-                    matched_phrase: m.phrase.clone(),
-                    command_name: m.command_name.clone(),
-                    command_action: m.command_action.clone(),
-                    confidence: 1.0,
-                    ..Default::default()
-                };
-            }
-        }
-        CommandDispatchResult::default()
     }
 
     pub fn process_partial(&self, text: &str) -> CommandDispatchResult {
@@ -80,7 +68,9 @@ impl CommandIntentResolver {
     }
 
     pub fn process_endpoint(&self, text: &str) -> CommandDispatchResult {
-        if let Some((engine, query)) = parse_search(text, &self.executor.context().search_engines) {
+        if let Some((engine, query)) =
+            parse_search(text, &self.executor.context().search_engines, &self.search_re_for, &self.search_re_short)
+        {
             let key = format!("smart_search_{engine}_{query}");
             if self.is_duplicate(&key) {
                 return CommandDispatchResult::default();
@@ -100,10 +90,7 @@ impl CommandIntentResolver {
         if let Some(app) = parse_smart_open(text) {
             let key = format!("smart_open_{app}");
             if self.is_duplicate(&key) {
-                return CommandDispatchResult {
-                    handled: true,
-                    ..Default::default()
-                };
+                return CommandDispatchResult::default();
             }
             self.record_execution(&key);
             return CommandDispatchResult {
@@ -121,10 +108,7 @@ impl CommandIntentResolver {
         if lookup.exact_match && !lookup.blocked_by_prefix {
             if let Some(m) = lookup.matches.first() {
                 if self.is_duplicate(&m.command_name) {
-                    return CommandDispatchResult {
-                        handled: true,
-                        ..Default::default()
-                    };
+                    return CommandDispatchResult::default();
                 }
                 self.record_execution(&m.command_name);
                 return CommandDispatchResult {
@@ -145,10 +129,7 @@ impl CommandIntentResolver {
         let (best, confidence) = self.executor.find_best_match(text, &self.commands, self.threshold);
         if let Some(cmd) = best {
             if self.is_duplicate(&cmd.name) {
-                return CommandDispatchResult {
-                    handled: true,
-                    ..Default::default()
-                };
+                return CommandDispatchResult::default();
             }
             let matched_phrase = cmd
                 .phrases
@@ -188,13 +169,36 @@ impl CommandIntentResolver {
     }
 }
 
-fn parse_search(text: &str, engines: &HashMap<String, String>) -> Option<(String, String)> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_returns_not_handled() {
+        let executor = Arc::new(CommandExecutor::new());
+        let mut resolver = CommandIntentResolver::new(executor);
+        resolver.set_commands(vec![crate::types::Command {
+            name: "Terminal".into(),
+            command: "kgx".into(),
+            phrases: vec!["open terminal".into()],
+        }]);
+        let first = resolver.process_endpoint("open terminal");
+        assert!(first.handled);
+        let dup = resolver.process_endpoint("open terminal");
+        assert!(!dup.handled);
+    }
+}
+
+fn parse_search(
+    text: &str,
+    engines: &HashMap<String, String>,
+    re_for: &Regex,
+    re_short: &Regex,
+) -> Option<(String, String)> {
     let norm = normalize_search(text);
-    let re_for = Regex::new(r"search\s+(\w+)\s+for\s+(.+)").ok()?;
     if let Some(caps) = re_for.captures(&norm) {
         return Some((caps[1].to_string(), caps[2].to_string()));
     }
-    let re_short = Regex::new(r"search\s+(\w+)\s+(.+)").ok()?;
     if let Some(caps) = re_short.captures(&norm) {
         if &caps[2] != "for" {
             return Some((caps[1].to_string(), caps[2].to_string()));

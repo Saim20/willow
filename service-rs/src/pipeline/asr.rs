@@ -15,7 +15,6 @@ pub struct AsrEngine {
     endpoint_silence: f32,
     enabled: bool,
     last_partial: String,
-    on_transcription: Option<Box<dyn Fn(TranscriptionResult) + Send + Sync>>,
 }
 
 impl AsrEngine {
@@ -27,15 +26,7 @@ impl AsrEngine {
             endpoint_silence: 0.3,
             enabled: false,
             last_partial: String::new(),
-            on_transcription: None,
         }
-    }
-
-    pub fn set_callback<F>(&mut self, f: F)
-    where
-        F: Fn(TranscriptionResult) + Send + Sync + 'static,
-    {
-        self.on_transcription = Some(Box::new(f));
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -75,12 +66,14 @@ impl AsrEngine {
         self.last_partial.clear();
     }
 
-    pub fn process_audio(&mut self, chunk: &[f32]) {
+    /// Decode audio and return any new partial/final transcription results.
+    pub fn process_audio(&mut self, chunk: &[f32]) -> Vec<TranscriptionResult> {
+        let mut results = Vec::new();
         if !self.enabled || chunk.is_empty() {
-            return;
+            return results;
         }
         let (Some(recognizer), Some(stream)) = (&self.recognizer, &self.stream) else {
-            return;
+            return results;
         };
 
         stream.accept_waveform(16000, chunk);
@@ -92,29 +85,26 @@ impl AsrEngine {
             let text = result.text.trim().to_string();
             if !text.is_empty() && text != self.last_partial {
                 self.last_partial = text.clone();
-                if let Some(cb) = &self.on_transcription {
-                    cb(TranscriptionResult {
-                        text: text.clone(),
-                        is_final: false,
-                        is_endpoint: false,
-                    });
-                }
+                results.push(TranscriptionResult {
+                    text: text.clone(),
+                    is_final: false,
+                    is_endpoint: false,
+                });
             }
 
             if recognizer.is_endpoint(stream) {
                 if !text.is_empty() {
-                    if let Some(cb) = &self.on_transcription {
-                        cb(TranscriptionResult {
-                            text,
-                            is_final: true,
-                            is_endpoint: true,
-                        });
-                    }
+                    results.push(TranscriptionResult {
+                        text,
+                        is_final: true,
+                        is_endpoint: true,
+                    });
                 }
                 recognizer.reset(stream);
                 self.last_partial.clear();
             }
         }
+        results
     }
 }
 
@@ -129,14 +119,14 @@ fn build_config(files: &TransducerModelFiles, endpoint_silence: f32) -> OnlineRe
             joiner: Some(files.joiner.clone()),
         },
         tokens: Some(files.tokens.clone()),
-        num_threads: 2,
+        num_threads: 1,
         provider: Some("cpu".into()),
         ..Default::default()
     };
     config.decoding_method = Some("greedy_search".into());
     config.enable_endpoint = true;
     config.rule1_min_trailing_silence = endpoint_silence;
-    config.rule2_min_trailing_silence = (endpoint_silence * 0.5).max(0.5);
+    config.rule2_min_trailing_silence = endpoint_silence * 0.75;
     config.rule3_min_utterance_length = 5.0;
     config
 }

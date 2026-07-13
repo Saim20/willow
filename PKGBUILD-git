@@ -45,9 +45,11 @@ package() {
     install -Dm755 service-rs/target/release/willow-service \
         "$pkgdir/usr/bin/willow-service"
 
-    sed 's|@CMAKE_INSTALL_PREFIX@|/usr|g' \
-        dbus/com.github.saim.Willow.service.in \
-        > "$pkgdir/usr/share/dbus-1/services/com.github.saim.Willow.service"
+    dbus_service="$(mktemp)"
+    sed 's|@CMAKE_INSTALL_PREFIX@|/usr|g' dbus/com.github.saim.Willow.service.in >"$dbus_service"
+    install -Dm644 "$dbus_service" \
+        "$pkgdir/usr/share/dbus-1/services/com.github.saim.Willow.service"
+    rm -f "$dbus_service"
 
     install -Dm644 dbus/com.github.saim.Willow.xml \
         "$pkgdir/usr/share/dbus-1/interfaces/com.github.saim.Willow.xml"

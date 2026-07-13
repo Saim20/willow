@@ -1,98 +1,80 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
 use tracing::{error, info};
 
-const CHUNK_SAMPLES: usize = 4096;
+const CHUNK_SAMPLES: usize = 1024;
+const SAMPLE_RATE: u32 = 16000;
 
 pub struct MicCapture;
 
 impl MicCapture {
-    /// Spawns a dedicated thread that owns the cpal stream (streams are !Send).
-    pub fn start<F>(mut on_chunk: F) -> Result<JoinHandle<()>>
+    /// Spawns a dedicated thread for microphone capture via PulseAudio/PipeWire.
+    /// Set the returned stop flag to end capture and allow the thread to join.
+    pub fn start<F>(mut on_chunk: F) -> Result<(JoinHandle<()>, Arc<AtomicBool>)>
     where
         F: FnMut(&[f32]) + Send + 'static,
     {
-        thread::Builder::new()
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+
+        let handle = thread::Builder::new()
             .name("willow-audio".into())
             .spawn(move || {
-                if let Err(e) = (|| -> Result<()> {
-                    let host = cpal::default_host();
-                    let device = host
-                        .default_input_device()
-                        .context("no default input device")?;
-                    info!("Microphone: {}", device.name().unwrap_or_default());
-
-                    let supported = device
-                        .supported_input_configs()
-                        .context("enumerate input configs")?;
-
-                    let config = supported
-                        .filter(|c| c.sample_format() == SampleFormat::F32)
-                        .find(|c| {
-                            c.min_sample_rate().0 <= 16000 && c.max_sample_rate().0 >= 16000
-                        })
-                        .or_else(|| {
-                            device
-                                .supported_input_configs()
-                                .ok()?
-                                .find(|c| c.sample_format() == SampleFormat::F32)
-                        })
-                        .context("no suitable F32 input config")?
-                        .with_sample_rate(cpal::SampleRate(16000));
-
-                    let sample_format = config.sample_format();
-                    let stream_config: StreamConfig = config.into();
-                    let err_fn = |e| error!("audio stream error: {e}");
-
-                    let stream = match sample_format {
-                        SampleFormat::F32 => device.build_input_stream(
-                            &stream_config,
-                            move |data: &[f32], _| on_chunk(data),
-                            err_fn,
-                            None,
-                        )?,
-                        SampleFormat::I16 => device.build_input_stream(
-                            &stream_config,
-                            move |data: &[i16], _| {
-                                let floats: Vec<f32> =
-                                    data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                                for chunk in floats.chunks(CHUNK_SAMPLES) {
-                                    on_chunk(chunk);
-                                }
-                            },
-                            err_fn,
-                            None,
-                        )?,
-                        SampleFormat::U16 => device.build_input_stream(
-                            &stream_config,
-                            move |data: &[u16], _| {
-                                let floats: Vec<f32> = data
-                                    .iter()
-                                    .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                                    .collect();
-                                for chunk in floats.chunks(CHUNK_SAMPLES) {
-                                    on_chunk(chunk);
-                                }
-                            },
-                            err_fn,
-                            None,
-                        )?,
-                        _ => anyhow::bail!("unsupported sample format {:?}", sample_format),
-                    };
-
-                    stream.play()?;
-                    Ok(())
-                })() {
+                if let Err(e) = run_pulse_capture(&stop_flag, &mut on_chunk) {
                     error!("Audio capture failed: {e}");
                 }
-                loop {
-                    thread::sleep(Duration::from_secs(3600));
-                }
             })
-            .context("spawn audio thread")
+            .context("spawn audio thread")?;
+
+        Ok((handle, stop))
     }
+}
+
+fn run_pulse_capture(
+    stop: &AtomicBool,
+    on_chunk: &mut dyn FnMut(&[f32]),
+) -> Result<()> {
+    use libpulse_binding as pulse;
+    use libpulse_simple_binding as psimple;
+
+    let spec = pulse::sample::Spec {
+        format: pulse::sample::Format::FLOAT32NE,
+        channels: 1,
+        rate: SAMPLE_RATE,
+    };
+    if !spec.is_valid() {
+        anyhow::bail!("invalid pulse audio spec");
+    }
+
+    let simple = psimple::Simple::new(
+        None,
+        "willow-service",
+        pulse::stream::Direction::Record,
+        None,
+        "capture",
+        &spec,
+        None,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("pulse connect: {e:?}"))?;
+
+    info!("Microphone: PulseAudio default source (16 kHz mono)");
+
+    let bytes_per_chunk = CHUNK_SAMPLES * std::mem::size_of::<f32>();
+    let mut buf = vec![0u8; bytes_per_chunk];
+
+    while !stop.load(Ordering::Relaxed) {
+        simple
+            .read(&mut buf)
+            .map_err(|e| anyhow::anyhow!("pulse read: {e:?}"))?;
+        let chunk: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .collect();
+        on_chunk(&chunk);
+    }
+    Ok(())
 }
