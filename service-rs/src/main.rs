@@ -5,7 +5,6 @@ mod audio;
 mod commands;
 mod pipeline;
 mod modes;
-mod tts;
 mod service;
 mod dbus;
 

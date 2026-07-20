@@ -13,22 +13,23 @@
   },
 
   "streaming_asr": {
-    "endpoint_silence_command": 0.3,
+    "endpoint_silence_command": 0.5,
     "endpoint_silence_typing": 0.45
   },
 
   "command_mode": {
-    "endpoint_silence": 0.3
+    "endpoint_silence": 0.5,
+    "incomplete_hold": 1.5,
+    "session_idle": 12.0,
+    "min_speech_duration": 0.1,
+    "vad_threshold": 0.45,
+    "whisper_pre_pad": 0.15,
+    "preroll": 0.15
   },
 
-  "tts": {
-    "enabled": false,
-    "events": {
-      "command_executed": false,
-      "mode_changed": false,
-      "search_executed": false,
-      "errors": false
-    }
+  "inference": {
+    "provider": "auto",
+    "num_threads": 0
   },
 
   "commands": [

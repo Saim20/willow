@@ -67,25 +67,37 @@ impl SpeakerVerifier {
         }
     }
 
-    pub fn initialize(&mut self, paths: &ModelPaths) -> Result<()> {
+    pub fn initialize(
+        &mut self,
+        paths: &ModelPaths,
+        requested_provider: &str,
+        num_threads: i32,
+    ) -> Result<()> {
         let model = paths
             .find_speaker_model()
             .context("speaker model not found")?;
-        let config = SpeakerEmbeddingExtractorConfig {
-            model: Some(model),
-            num_threads: 1,
-            debug: false,
-            provider: Some("cpu".into()),
-        };
-        let extractor =
-            SpeakerEmbeddingExtractor::create(&config).context("create speaker extractor")?;
-        let dim = extractor.dim();
-        let manager = SpeakerEmbeddingManager::create(dim).context("create speaker manager")?;
-        self.extractor = Some(extractor);
-        self.manager = Some(manager);
-        self.load_profile()?;
-        info!("Speaker verifier initialized");
-        Ok(())
+        let threads = crate::pipeline::provider::resolve_num_threads(num_threads);
+        for provider in crate::pipeline::provider::resolve_provider(requested_provider) {
+            let config = SpeakerEmbeddingExtractorConfig {
+                model: Some(model.clone()),
+                num_threads: threads,
+                debug: false,
+                provider: Some(provider.into()),
+            };
+            if let Some(extractor) = SpeakerEmbeddingExtractor::create(&config) {
+                let dim = extractor.dim();
+                let manager =
+                    SpeakerEmbeddingManager::create(dim).context("create speaker manager")?;
+                self.extractor = Some(extractor);
+                self.manager = Some(manager);
+                self.load_profile()?;
+                crate::pipeline::provider::log_provider_choice(requested_provider, provider);
+                info!("Speaker verifier initialized (provider={provider})");
+                return Ok(());
+            }
+            warn!("Speaker init with provider={provider} failed");
+        }
+        anyhow::bail!("speaker init failed")
     }
 
     pub fn is_enrolled(&self) -> bool {

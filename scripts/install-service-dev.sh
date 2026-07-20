@@ -46,13 +46,23 @@ sed "s|ExecStart=/usr/bin/willow-service|ExecStart=$BIN_DIR/willow-service|" \
     "$ROOT/systemd/willow.service" >"$SYSTEMD_DIR/willow.service"
 
 log "→ Updating dev override"
+OVERRIDE_ENV="Environment=WILLOW_SOURCE_ROOT=$ROOT
+Environment=PATH=$BIN_DIR:/usr/bin:/usr/local/bin
+TimeoutStopSec=15"
+if [[ -n "${WILLOW_CUDA_LIB_DIR:-}" ]]; then
+    OVERRIDE_ENV="${OVERRIDE_ENV}
+Environment=SHERPA_ONNX_LIB_DIR=${WILLOW_CUDA_LIB_DIR}
+Environment=LD_LIBRARY_PATH=${WILLOW_CUDA_LIB_DIR}"
+    if [[ -n "${WILLOW_CUDA12_COMPAT_LIB_DIR:-}" ]]; then
+        OVERRIDE_ENV="${OVERRIDE_ENV}
+Environment=LD_LIBRARY_PATH=${WILLOW_CUDA12_COMPAT_LIB_DIR}:${WILLOW_CUDA_LIB_DIR}"
+    fi
+fi
 cat >"$OVERRIDE_DIR/override.conf" <<EOF
 [Service]
 ExecStart=
 ExecStart=$BIN_DIR/willow-service
-Environment=WILLOW_SOURCE_ROOT=$ROOT
-Environment=PATH=$BIN_DIR:/usr/bin:/usr/local/bin
-TimeoutStopSec=15
+${OVERRIDE_ENV}
 EOF
 
 log "→ Reloading systemd user daemon"

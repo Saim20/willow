@@ -12,7 +12,6 @@ use crate::config::{load_config, save_config, WillowConfig};
 use crate::modes::ModeStateMachine;
 use crate::models::{keyword_encoding_available, ModelPaths};
 use crate::pipeline::SpeechPipeline;
-use crate::tts::TtsEngine;
 use crate::types::{EnrollmentState, Mode, TranscriptionResult};
 
 fn dbus_str(s: &str) -> zvariant::OwnedValue {
@@ -59,6 +58,7 @@ struct ServiceInner {
     listening_desired: bool,
     audio_active: bool,
     is_running: bool,
+    asr_unavailable_notified: bool,
 }
 
 impl ServiceInner {
@@ -79,19 +79,28 @@ impl ServiceInner {
             .handle_transcription(result, &mut self.pipeline)
     }
 
-    /// Process one mic chunk under a single lock (no re-entrant callbacks).
-    fn process_audio_chunk(&mut self, chunk: &[f32]) -> Vec<ServiceEvent> {
+    /// Fast path under the service lock: AGC, KWS, VAD — no Whisper.
+    fn process_audio_pre_whisper(
+        &mut self,
+        chunk: &[f32],
+    ) -> (
+        Vec<ServiceEvent>,
+        Vec<Vec<f32>>,
+        Arc<crate::pipeline::WhisperEngine>,
+        f32,
+    ) {
         let mut events = Vec::new();
         let pipeline_events = self.pipeline.process_audio(chunk);
-
-        if pipeline_events.asr_unavailable {
-            events.push(ServiceEvent::Error {
-                message: "ASR Unavailable".into(),
-                details: "Speech recognition model not loaded".into(),
-            });
-        }
+        let whisper = self.pipeline.whisper_handle();
+        let pre_pad = self.pipeline.whisper_pre_pad();
+        let segments = pipeline_events.speech_segments;
 
         for keyword in &pipeline_events.keywords {
+            if matches!(keyword.as_str(), "command" | "typing") && !self.pipeline.ready_for_command()
+            {
+                self.push_asr_unavailable_once(&mut events);
+                continue;
+            }
             if let Some(change) = self.handle_keyword(keyword) {
                 events.push(ServiceEvent::ModeChanged {
                     new_mode: change.new_mode.as_str().to_string(),
@@ -102,85 +111,111 @@ impl ServiceInner {
         }
 
         for reason in pipeline_events.speaker_fails {
-            events.push(ServiceEvent::SpeakerVerificationFailed(reason.clone()));
-            if self.config.tts.enabled && self.config.tts.events.errors {
-                self.mode_machine.speak_speaker_rejected();
-            }
+            events.push(ServiceEvent::SpeakerVerificationFailed(reason));
         }
 
         for (phrase, blocked) in pipeline_events.command_pending {
             events.push(ServiceEvent::CommandPending { phrase, blocked });
         }
 
-        for result in pipeline_events.transcriptions {
-            events.push(ServiceEvent::PartialBufferChanged {
-                partial: result.text.clone(),
-                is_final: result.is_final,
+        self.collect_enrollment_events(&mut events);
+
+        if let Some(change) = self.mode_machine.tick_idle(&mut self.pipeline) {
+            events.push(ServiceEvent::ModeChanged {
+                new_mode: change.new_mode.as_str().to_string(),
+                old_mode: change.old_mode.as_str().to_string(),
             });
-            if matches!(self.mode_machine.mode(), Mode::Command | Mode::Typing)
-                && !result.text.is_empty()
-            {
-                events.push(ServiceEvent::BufferChanged(result.text.clone()));
+            events.push(ServiceEvent::StatusChanged);
+        }
+
+        (events, segments, whisper, pre_pad)
+    }
+
+    fn push_asr_unavailable_once(&mut self, events: &mut Vec<ServiceEvent>) {
+        if self.asr_unavailable_notified {
+            return;
+        }
+        self.asr_unavailable_notified = true;
+        events.push(ServiceEvent::Error {
+            message: "ASR Unavailable".into(),
+            details: "Whisper/VAD models missing — run ./deploy-dev.sh or willow-download-model"
+                .into(),
+        });
+    }
+    fn finish_with_transcripts(&mut self, texts: Vec<String>) -> Vec<ServiceEvent> {
+        let mut events = Vec::new();
+        for text in texts {
+            let result = TranscriptionResult {
+                text: text.clone(),
+                is_final: true,
+                is_endpoint: true,
+            };
+            events.push(ServiceEvent::PartialBufferChanged {
+                partial: text.clone(),
+                is_final: true,
+            });
+            if matches!(self.mode_machine.mode(), Mode::Command | Mode::Typing) {
+                events.push(ServiceEvent::BufferChanged(text));
             }
             if let Some(change) = self.handle_transcription(&result) {
                 events.push(ServiceEvent::ModeChanged {
                     new_mode: change.new_mode.as_str().to_string(),
                     old_mode: change.old_mode.as_str().to_string(),
                 });
-                events.push(ServiceEvent::StatusChanged);
-            } else if result.is_endpoint || result.is_final {
+            }
+            events.push(ServiceEvent::StatusChanged);
+        }
+        events
+    }
+
+    fn collect_enrollment_events(&mut self, events: &mut Vec<ServiceEvent>) {
+        if self.pipeline.speaker.enrollment_state() != EnrollmentState::Recording {
+            return;
+        }
+        let before = self.pipeline.speaker.enrollment_progress();
+        let state_before = self.pipeline.speaker.enrollment_state();
+        let normalized = self.pipeline.last_normalized_chunk().to_vec();
+        self.pipeline.speaker.add_enrollment_audio(&normalized);
+        let after = self.pipeline.speaker.enrollment_progress();
+        let state_after = self.pipeline.speaker.enrollment_state();
+
+        if state_before == EnrollmentState::Recording
+            && state_after == EnrollmentState::Failed
+            && after < 3
+        {
+            events.push(ServiceEvent::Error {
+                message: "Enrollment Error".into(),
+                details: if after == 0 {
+                    "Enrollment timed out — speak steadily right after pressing Start".into()
+                } else {
+                    "Enrollment failed — speak louder and try again".into()
+                },
+            });
+        } else if after > before {
+            events.push(ServiceEvent::StatusChanged);
+        } else if self.pipeline.speaker.should_prompt_for_speech() {
+            self.pipeline.speaker.mark_speech_prompt_sent();
+            let prompt = self.pipeline.speaker.current_enrollment_prompt();
+            if !prompt.is_empty() {
+                events.push(ServiceEvent::Notification {
+                    title: "Voice Enrollment".into(),
+                    message: prompt.into(),
+                    urgency: "normal".into(),
+                });
                 events.push(ServiceEvent::StatusChanged);
             }
         }
 
-        if self.pipeline.speaker.enrollment_state() == EnrollmentState::Recording {
-            let before = self.pipeline.speaker.enrollment_progress();
-            let state_before = self.pipeline.speaker.enrollment_state();
-            self.pipeline.speaker.add_enrollment_audio(chunk);
-            let after = self.pipeline.speaker.enrollment_progress();
-            let state_after = self.pipeline.speaker.enrollment_state();
-
-            if state_before == EnrollmentState::Recording
-                && state_after == EnrollmentState::Failed
-                && after < 3
-            {
+        if self.pipeline.speaker.enrollment_progress() >= 3 {
+            let ok = self.pipeline.speaker.finish_enrollment();
+            events.push(ServiceEvent::StatusChanged);
+            if !ok {
                 events.push(ServiceEvent::Error {
                     message: "Enrollment Error".into(),
-                    details: if after == 0 {
-                        "Enrollment timed out — speak steadily right after pressing Start".into()
-                    } else {
-                        "Enrollment failed — speak louder and try again".into()
-                    },
+                    details: "Could not build voice profile — speak louder and try again".into(),
                 });
-            } else if after > before {
-                events.push(ServiceEvent::StatusChanged);
-            } else if self.pipeline.speaker.should_prompt_for_speech() {
-                self.pipeline.speaker.mark_speech_prompt_sent();
-                let prompt = self.pipeline.speaker.current_enrollment_prompt();
-                if !prompt.is_empty() {
-                    events.push(ServiceEvent::Notification {
-                        title: "Voice Enrollment".into(),
-                        message: prompt.into(),
-                        urgency: "normal".into(),
-                    });
-                    events.push(ServiceEvent::StatusChanged);
-                }
-            }
-
-            if self.pipeline.speaker.enrollment_progress() >= 3 {
-                let ok = self.pipeline.speaker.finish_enrollment();
-                events.push(ServiceEvent::StatusChanged);
-                if !ok {
-                    events.push(ServiceEvent::Error {
-                        message: "Enrollment Error".into(),
-                        details: "Could not build voice profile — speak louder and try again"
-                            .into(),
-                    });
-                }
             }
         }
-
-        events
     }
 }
 
@@ -190,13 +225,11 @@ impl ServiceCore {
         let models_path = ModelPaths::from_home();
         let executor = Arc::new(CommandExecutor::new());
         let resolver = CommandIntentResolver::new(executor.clone());
-        let tts = Arc::new(TtsEngine::new());
         let command_executed_cb: Arc<Mutex<Option<Arc<dyn Fn(String, String, f64) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
         let cb_slot = command_executed_cb.clone();
         let worker = CommandWorker::new(
             executor,
-            tts.clone(),
             Arc::new(move |command, phrase, confidence| {
                 if let Some(cb) = cb_slot.lock().unwrap().as_ref() {
                     cb(command, phrase, confidence);
@@ -217,10 +250,11 @@ impl ServiceCore {
             inner: Arc::new(Mutex::new(ServiceInner {
                 config: config.clone(),
                 pipeline,
-                mode_machine: ModeStateMachine::new(worker, tts),
+                mode_machine: ModeStateMachine::new(worker),
                 listening_desired: true,
                 audio_active: false,
                 is_running: false,
+                asr_unavailable_notified: false,
             })),
             event_cb: Mutex::new(None),
             audio_thread: Mutex::new(None),
@@ -260,6 +294,18 @@ impl ServiceCore {
         let old = st.mode_machine.mode();
         if new_mode == old {
             return Ok(());
+        }
+        if matches!(new_mode, Mode::Command | Mode::Typing) && !st.pipeline.ready_for_command() {
+            let mut events = Vec::new();
+            st.push_asr_unavailable_once(&mut events);
+            drop(st);
+            for ev in events {
+                self.emit(ev);
+            }
+            anyhow::bail!("ASR models not loaded — cannot enter {mode} mode");
+        }
+        if st.pipeline.ready_for_command() {
+            st.asr_unavailable_notified = false;
         }
         st.set_mode(new_mode);
         drop(st);
@@ -318,7 +364,15 @@ impl ServiceCore {
         );
         map.insert(
             "whisper_loaded".into(),
-            zvariant::OwnedValue::from(st.pipeline.ready_for_command()),
+            zvariant::OwnedValue::from(st.pipeline.whisper_ready()),
+        );
+        map.insert(
+            "whisper_ready".into(),
+            zvariant::OwnedValue::from(st.pipeline.whisper_ready()),
+        );
+        map.insert(
+            "inference_provider".into(),
+            dbus_str(st.pipeline.active_provider()),
         );
         map.insert(
             "kws_active".into(),
@@ -377,11 +431,7 @@ impl ServiceCore {
         );
         map.insert(
             "streaming_active".into(),
-            zvariant::OwnedValue::from(st.pipeline.asr.is_loaded()),
-        );
-        map.insert(
-            "tts_enabled".into(),
-            zvariant::OwnedValue::from(st.config.tts.enabled),
+            zvariant::OwnedValue::from(st.pipeline.whisper_ready()),
         );
         map
     }
@@ -421,6 +471,29 @@ impl ServiceCore {
                 st.config.command_threshold = threshold * 100.0;
                 let threshold_frac = st.config.command_threshold_fraction();
                 st.pipeline.resolver.set_threshold(threshold_frac);
+            }
+            "inference.provider" | "provider" => {
+                let provider: String = value.try_into()?;
+                st.config.inference.provider = provider;
+                let cfg = st.config.clone();
+                st.pipeline.apply_config(&cfg)?;
+            }
+            "command_mode.endpoint_silence"
+            | "endpoint_silence"
+            | "processing_interval" => {
+                let secs: f64 = value.try_into()?;
+                st.config.command_mode.endpoint_silence = (secs as f32).clamp(0.15, 2.0);
+                st.config.streaming_asr.endpoint_silence_command =
+                    st.config.command_mode.endpoint_silence;
+                let cfg = st.config.clone();
+                st.pipeline.apply_config(&cfg)?;
+                st.mode_machine.apply_config(&cfg);
+            }
+            "command_mode.incomplete_hold" | "incomplete_hold" => {
+                let secs: f64 = value.try_into()?;
+                st.config.command_mode.incomplete_hold = (secs as f32).clamp(0.3, 8.0);
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
             }
             _ => {}
         }
@@ -631,10 +704,46 @@ impl ServiceCore {
         let inner = self.inner.clone();
         let tx_audio = tx.clone();
         let (handle, stop) = MicCapture::start(move |chunk| {
-            let events = {
+            let (mut events, segments, whisper, pre_pad) = {
                 let mut st = inner.lock().unwrap();
-                st.process_audio_chunk(chunk)
+                st.process_audio_pre_whisper(chunk)
             };
+            // Whisper outside the service mutex so D-Bus stays responsive.
+            // In command mode, join segments from the same flush so a split phrase
+            // is transcribed once instead of as isolated scraps.
+            let segments = {
+                let mode = {
+                    let st = inner.lock().unwrap();
+                    st.mode_machine.mode()
+                };
+                if matches!(mode, crate::types::Mode::Command) && segments.len() > 1 {
+                    let mut joined = Vec::new();
+                    let total: usize = segments.iter().map(|s| s.len()).sum();
+                    joined.reserve(total);
+                    for seg in segments {
+                        joined.extend_from_slice(&seg);
+                    }
+                    vec![joined]
+                } else {
+                    segments
+                }
+            };
+            let texts: Vec<String> = segments
+                .into_iter()
+                .filter_map(|seg| {
+                    let text = whisper.transcribe(&seg, pre_pad);
+                    if text.is_empty() {
+                        None
+                    } else {
+                        tracing::info!("Whisper: {text}");
+                        Some(text)
+                    }
+                })
+                .collect();
+            if !texts.is_empty() {
+                let mut st = inner.lock().unwrap();
+                events.extend(st.finish_with_transcripts(texts));
+            }
             for ev in events {
                 let _ = tx_audio.send(ev);
             }

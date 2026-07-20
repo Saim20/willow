@@ -26,40 +26,34 @@ export class WhisperModelManager {
                 check: () => this._hasOnnxFiles(`${this._modelDir}/kws`),
             },
             {
-                id: 'streaming',
-                name: 'Streaming ASR',
-                description: 'Real-time speech recognition for command and typing modes',
-                size: '~120 MB',
-                check: () => this._hasOnnxFiles(`${this._modelDir}/streaming`),
+                id: 'whisper',
+                name: 'Whisper ASR',
+                description: 'Command and typing recognition (VAD-segmented)',
+                size: '~75 MB',
+                check: () => this._hasWhisperFiles(`${this._modelDir}/whisper`),
             },
             {
-                id: 'speaker',
-                name: 'Speaker Verification',
-                description: 'Voice profile matching after hotword activation',
-                size: '~25 MB',
-                check: () => Gio.File.new_for_path(`${this._modelDir}/speaker/model.onnx`).query_exists(null),
+                id: 'vad',
+                name: 'Silero VAD',
+                description: 'Speech endpointing for Whisper',
+                size: '~1 MB',
+                check: () => Gio.File.new_for_path(`${this._modelDir}/vad/silero_vad.onnx`).query_exists(null),
             },
         ];
     }
 
     _getActiveBundles() {
-        if (!this._isSpeakerVerificationEnabled()) {
-            return this._bundles.filter(bundle => bundle.id !== 'speaker');
-        }
         return this._bundles;
     }
 
     _isSpeakerVerificationEnabled() {
-        const config = this._configManager?.getConfig();
-        return config?.speaker_verification?.enabled ?? false;
+        return false;
     }
 
     createModelGroup(window) {
         const group = new Adw.PreferencesGroup({
             title: 'Speech Models',
-            description: this._isSpeakerVerificationEnabled()
-                ? 'Sherpa-onnx models for keyword spotting, streaming ASR, and speaker verification'
-                : 'Sherpa-onnx models for keyword spotting and streaming ASR',
+            description: 'Sherpa-onnx models for hotword, VAD, and Whisper ASR',
         });
 
         this._group = group;
@@ -103,9 +97,7 @@ export class WhisperModelManager {
 
         const downloadRow = new Adw.ActionRow({
             title: 'Download All Models',
-            subtitle: this._isSpeakerVerificationEnabled()
-                ? 'Downloads sherpa-onnx models (~160 MB total)'
-                : 'Downloads hotword and ASR models (~135 MB total)',
+            subtitle: 'Downloads hotword, Whisper, and VAD models (~95 MB total)',
         });
         const downloadButton = new Gtk.Button({
             icon_name: 'folder-download-symbolic',
@@ -154,6 +146,36 @@ export class WhisperModelManager {
             }
             enumerator.close(null);
             return hasOnnx && (hasTokens || dirPath.endsWith('/speaker'));
+        } catch (e) {
+            return false;
+        }
+    }
+
+    _hasWhisperFiles(dirPath) {
+        const dir = Gio.File.new_for_path(dirPath);
+        if (!dir.query_exists(null)) {
+            return false;
+        }
+        try {
+            const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            let hasEncoder = false;
+            let hasDecoder = false;
+            let hasTokens = false;
+            while ((info = enumerator.next_file(null))) {
+                const name = info.get_name().toLowerCase();
+                if (name.includes('encoder') && name.endsWith('.onnx')) {
+                    hasEncoder = true;
+                }
+                if (name.includes('decoder') && name.endsWith('.onnx')) {
+                    hasDecoder = true;
+                }
+                if (name === 'tokens.txt') {
+                    hasTokens = true;
+                }
+            }
+            enumerator.close(null);
+            return hasEncoder && hasDecoder && hasTokens;
         } catch (e) {
             return false;
         }

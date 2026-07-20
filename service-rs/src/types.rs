@@ -93,12 +93,3 @@ impl Default for CommandDispatchResult {
         }
     }
 }
-
-#[derive(Debug, Clone, Default)]
-pub struct TtsConfig {
-    pub enabled: bool,
-    pub command_executed: bool,
-    pub mode_changed: bool,
-    pub search_executed: bool,
-    pub errors: bool,
-}

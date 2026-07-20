@@ -26,6 +26,11 @@ impl KeywordsSource {
     }
 }
 
+/// Below this RMS (post-AGC) audio is treated as silence for decode scheduling.
+const KWS_SILENCE_RMS: f32 = 0.012;
+/// Keep decoding after speech so trailing-blank confirmation can fire (~0.6s).
+const KWS_DECODE_HANGOVER: u32 = 10;
+
 pub struct KwsEngine {
     spotter: Option<KeywordSpotter>,
     stream: Option<OnlineStream>,
@@ -35,6 +40,8 @@ pub struct KwsEngine {
     enabled: bool,
     keywords_source: KeywordsSource,
     init_error: Option<String>,
+    /// Remaining silence chunks to keep decoding after speech.
+    decode_hangover: u32,
 }
 
 impl KwsEngine {
@@ -48,6 +55,7 @@ impl KwsEngine {
             enabled: true,
             keywords_source: KeywordsSource::Failed,
             init_error: None,
+            decode_hangover: 0,
         }
     }
 
@@ -67,7 +75,13 @@ impl KwsEngine {
         self.enabled = enabled;
     }
 
-    pub fn initialize(&mut self, threshold: f32, keywords: &[String]) -> Result<()> {
+    pub fn initialize(
+        &mut self,
+        threshold: f32,
+        keywords: &[String],
+        requested_provider: &str,
+        num_threads: i32,
+    ) -> Result<()> {
         self.threshold = threshold;
         self.keywords = keywords.to_vec();
         self.init_error = None;
@@ -87,39 +101,61 @@ impl KwsEngine {
             );
         }
 
-        let config = build_config(&files, threshold, &keywords_path);
-
-        match KeywordSpotter::create(&config) {
-            Some(spotter) => {
+        let threads = crate::pipeline::provider::resolve_num_threads(num_threads);
+        for provider in crate::pipeline::provider::resolve_provider(requested_provider) {
+            let config = build_config(&files, threshold, &keywords_path, provider, threads);
+            if let Some(spotter) = KeywordSpotter::create(&config) {
                 let stream = spotter.create_stream();
                 self.spotter = Some(spotter);
                 self.stream = Some(stream);
-                info!("KWS engine initialized (keywords: {})", source.as_str());
-                Ok(())
+                crate::pipeline::provider::log_provider_choice(requested_provider, provider);
+                info!(
+                    "KWS engine initialized (keywords: {}, provider={provider})",
+                    source.as_str()
+                );
+                return Ok(());
             }
-            None => {
-                self.spotter = None;
-                self.stream = None;
-                self.keywords_source = KeywordsSource::Failed;
-                let msg = "create KeywordSpotter failed".to_string();
-                self.init_error = Some(msg.clone());
-                error!("{msg}");
-                Err(anyhow::anyhow!(msg))
-            }
+            warn!("KWS create failed for provider={provider}");
         }
+
+        self.spotter = None;
+        self.stream = None;
+        self.keywords_source = KeywordsSource::Failed;
+        let msg = "create KeywordSpotter failed".to_string();
+        self.init_error.replace(msg.clone());
+        error!("{msg}");
+        Err(anyhow::anyhow!(msg))
     }
 
     /// Decode audio and return any keywords detected in this chunk.
-    pub fn process_audio(&self, chunk: &[f32]) -> Vec<String> {
+    /// Waveform is always accepted; decode runs during speech and a short
+    /// post-speech hangover (needed for trailing-blank confirmation), then
+    /// idles to keep continuous listening cheap.
+    pub fn process_audio(&mut self, chunk: &[f32]) -> Vec<String> {
         let mut detected = Vec::new();
         if !self.enabled || chunk.is_empty() {
             return detected;
         }
-        let (Some(spotter), Some(stream)) = (&self.spotter, &self.stream) else {
+        if self.spotter.is_none() || self.stream.is_none() {
             return detected;
-        };
+        }
 
+        let speaking = chunk_rms(chunk) >= KWS_SILENCE_RMS;
+        let should_decode = speaking || self.decode_hangover > 0;
+        if speaking {
+            self.decode_hangover = KWS_DECODE_HANGOVER;
+        } else if self.decode_hangover > 0 {
+            self.decode_hangover -= 1;
+        }
+
+        let spotter = self.spotter.as_ref().unwrap();
+        let stream = self.stream.as_ref().unwrap();
         stream.accept_waveform(16000, chunk);
+
+        if !should_decode {
+            return detected;
+        }
+
         while spotter.is_ready(stream) {
             spotter.decode(stream);
             if let Some(result) = spotter.get_result(stream) {
@@ -165,7 +201,21 @@ impl KwsEngine {
     }
 }
 
-fn build_config(files: &TransducerModelFiles, threshold: f32, keywords_file: &str) -> KeywordSpotterConfig {
+fn chunk_rms(chunk: &[f32]) -> f32 {
+    if chunk.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+    (sum / chunk.len() as f64).sqrt() as f32
+}
+
+fn build_config(
+    files: &TransducerModelFiles,
+    threshold: f32,
+    keywords_file: &str,
+    provider: &str,
+    num_threads: i32,
+) -> KeywordSpotterConfig {
     let mut config = KeywordSpotterConfig::default();
     config.feat_config.sample_rate = 16000;
     config.feat_config.feature_dim = 80;
@@ -176,10 +226,14 @@ fn build_config(files: &TransducerModelFiles, threshold: f32, keywords_file: &st
             joiner: Some(files.joiner.clone()),
         },
         tokens: Some(files.tokens.clone()),
-        num_threads: 1,
-        provider: Some("cpu".into()),
+        num_threads,
+        provider: Some(provider.into()),
         ..Default::default()
     };
+    // Slight keyword bias + two trailing blanks improve recall without flooding FPs.
+    config.max_active_paths = 4;
+    config.num_trailing_blanks = 2;
+    config.keywords_score = 1.5;
     config.keywords_threshold = threshold;
     config.keywords_file = Some(keywords_file.to_string());
     config

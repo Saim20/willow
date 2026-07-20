@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Command, TtsConfig};
+use crate::types::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WillowConfig {
@@ -15,7 +15,8 @@ pub struct WillowConfig {
     pub streaming_asr: StreamingConfig,
     pub command_mode: CommandModeConfig,
     pub typing_mode: TypingModeConfig,
-    pub tts: TtsSection,
+    #[serde(default)]
+    pub inference: InferenceConfig,
     pub commands: Vec<Command>,
 }
 
@@ -39,7 +40,87 @@ pub struct StreamingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandModeConfig {
+    /// Silence (seconds) after speech before the utterance is closed and executed.
+    #[serde(default = "default_endpoint_silence")]
     pub endpoint_silence: f32,
+    /// How long to wait for the rest of a bare prefix like "open …".
+    #[serde(default = "default_incomplete_hold")]
+    pub incomplete_hold: f32,
+    /// Return to Normal after this many idle seconds in Command/Typing.
+    #[serde(default = "default_session_idle")]
+    pub session_idle: f32,
+    /// Minimum speech length for Silero VAD (lower = catch short leading words).
+    #[serde(default = "default_min_speech_duration")]
+    pub min_speech_duration: f32,
+    /// Silero speech probability threshold (lower = more sensitive onset).
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    /// Seconds of silence prepended before Whisper (helps first-word accuracy).
+    #[serde(default = "default_whisper_pre_pad")]
+    pub whisper_pre_pad: f32,
+    /// Extra audio from before VAD onset, prepended to each segment.
+    #[serde(default = "default_preroll")]
+    pub preroll: f32,
+}
+
+fn default_endpoint_silence() -> f32 {
+    // Long enough that natural pauses between words don't split "open firefox".
+    0.5
+}
+fn default_incomplete_hold() -> f32 {
+    1.5
+}
+fn default_session_idle() -> f32 {
+    12.0
+}
+fn default_min_speech_duration() -> f32 {
+    0.1
+}
+fn default_vad_threshold() -> f32 {
+    0.45
+}
+fn default_whisper_pre_pad() -> f32 {
+    0.15
+}
+fn default_preroll() -> f32 {
+    0.15
+}
+
+impl Default for CommandModeConfig {
+    fn default() -> Self {
+        Self {
+            endpoint_silence: default_endpoint_silence(),
+            incomplete_hold: default_incomplete_hold(),
+            session_idle: default_session_idle(),
+            min_speech_duration: default_min_speech_duration(),
+            vad_threshold: default_vad_threshold(),
+            whisper_pre_pad: default_whisper_pre_pad(),
+            preroll: default_preroll(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    /// `auto` (prefer CUDA), `cuda`, or `cpu`.
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// `0` = auto (up to 4 threads).
+    #[serde(default)]
+    pub num_threads: i32,
+}
+
+fn default_provider() -> String {
+    "auto".into()
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            num_threads: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,20 +129,6 @@ pub struct TypingModeConfig {
     pub max_backspace: i32,
     pub check_recent_chars: i32,
     pub exit_phrases: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TtsSection {
-    pub enabled: bool,
-    pub events: TtsEvents,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TtsEvents {
-    pub command_executed: bool,
-    pub mode_changed: bool,
-    pub search_executed: bool,
-    pub errors: bool,
 }
 
 impl Default for WillowConfig {
@@ -76,12 +143,10 @@ impl Default for WillowConfig {
             },
             kws: KwsConfig { threshold: 0.25 },
             streaming_asr: StreamingConfig {
-                endpoint_silence_command: 0.3,
+                endpoint_silence_command: default_endpoint_silence(),
                 endpoint_silence_typing: 0.45,
             },
-            command_mode: CommandModeConfig {
-                endpoint_silence: 0.3,
-            },
+            command_mode: CommandModeConfig::default(),
             typing_mode: TypingModeConfig {
                 realtime: false,
                 max_backspace: 80,
@@ -93,15 +158,7 @@ impl Default for WillowConfig {
                     "go to normal mode".into(),
                 ],
             },
-            tts: TtsSection {
-                enabled: false,
-                events: TtsEvents {
-                    command_executed: false,
-                    mode_changed: false,
-                    search_executed: false,
-                    errors: false,
-                },
-            },
+            inference: InferenceConfig::default(),
             commands: default_commands(),
         }
     }
@@ -113,16 +170,6 @@ impl WillowConfig {
             self.command_threshold / 100.0
         } else {
             self.command_threshold
-        }
-    }
-
-    pub fn tts_config(&self) -> TtsConfig {
-        TtsConfig {
-            enabled: self.tts.enabled,
-            command_executed: self.tts.events.command_executed,
-            mode_changed: self.tts.events.mode_changed,
-            search_executed: self.tts.events.search_executed,
-            errors: self.tts.events.errors,
         }
     }
 

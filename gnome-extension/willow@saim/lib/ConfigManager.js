@@ -146,6 +146,20 @@ export class ConfigManager {
         // Update basic settings
         config.hotword = this._settings.get_string('hotword');
         config.command_threshold = this._settings.get_int('command-threshold');
+        if (!config.inference) {
+            config.inference = {};
+        }
+        config.inference.provider = this._settings.get_boolean('gpu-acceleration') ? 'auto' : 'cpu';
+        if (!config.command_mode) {
+            config.command_mode = {};
+        }
+        config.command_mode.endpoint_silence = this._settings.get_double('command-endpoint-silence');
+        config.command_mode.incomplete_hold = this._settings.get_double('incomplete-phrase-wait');
+        if (!config.streaming_asr) {
+            config.streaming_asr = {};
+        }
+        config.streaming_asr.endpoint_silence_command = config.command_mode.endpoint_silence;
+        this._settings.set_double('processing-interval', config.command_mode.endpoint_silence);
 
         // Persist locally only; push hotword via Apply button, threshold via SetConfigValue.
         return this.saveConfig(config, false);
@@ -159,6 +173,19 @@ export class ConfigManager {
         
         this._settings.set_string('hotword', config.hotword || 'hey willow');
         this._settings.set_int('command-threshold', config.command_threshold || 80);
+        const endpoint = config.command_mode?.endpoint_silence ?? 0.35;
+        this._settings.set_double('command-endpoint-silence', endpoint);
+        this._settings.set_double('processing-interval', endpoint);
+        this._settings.set_double(
+            'incomplete-phrase-wait',
+            config.command_mode?.incomplete_hold ?? 1.2
+        );
+        if (config.inference?.provider) {
+            this._settings.set_boolean(
+                'gpu-acceleration',
+                config.inference.provider !== 'cpu'
+            );
+        }
     }
 
     /**

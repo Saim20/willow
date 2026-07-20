@@ -42,6 +42,7 @@ impl CommandIntentResolver {
         self.threshold = threshold;
     }
 
+    #[allow(dead_code)] // Kept for live partial UX if we add tentative UI later.
     pub fn process_partial(&self, text: &str) -> CommandDispatchResult {
         let norm = normalize(text);
         if norm.starts_with("search") {
@@ -187,6 +188,31 @@ mod tests {
         let dup = resolver.process_endpoint("open terminal");
         assert!(!dup.handled);
     }
+
+    #[test]
+    fn smart_open_extracts_app() {
+        let executor = Arc::new(CommandExecutor::new());
+        let resolver = CommandIntentResolver::new(executor);
+        let r = resolver.process_endpoint("open firefox");
+        assert!(r.handled);
+        assert!(r.is_smart_open);
+        assert_eq!(r.app_name, "firefox");
+    }
+
+    #[test]
+    fn smart_open_strips_article() {
+        assert_eq!(parse_smart_open("open the terminal").as_deref(), Some("terminal"));
+    }
+
+    #[test]
+    fn smart_open_skips_start_typing() {
+        assert_eq!(parse_smart_open("start typing"), None);
+    }
+
+    #[test]
+    fn bare_open_is_not_smart_open() {
+        assert_eq!(parse_smart_open("open"), None);
+    }
 }
 
 fn parse_search(
@@ -220,7 +246,17 @@ fn parse_smart_open(text: &str) -> Option<String> {
     for trigger in ["open ", "launch ", "start "] {
         if let Some(pos) = norm.find(trigger) {
             let app = norm[pos + trigger.len()..].trim();
+            // Ignore articles so "open the firefox" still works; reject empty.
+            let app = app
+                .strip_prefix("the ")
+                .or_else(|| app.strip_prefix("a "))
+                .unwrap_or(app)
+                .trim();
             if !app.is_empty() {
+                // Don't steal mode phrases like "start typing".
+                if trigger == "start " && matches!(app, "typing" | "dictation") {
+                    continue;
+                }
                 return Some(app.to_string());
             }
         }

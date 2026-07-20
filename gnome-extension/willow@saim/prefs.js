@@ -108,6 +108,29 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
             recognitionGroup
         );
 
+        this._prefsBuilder.createDoubleSpinButtonRow(
+            'Command Silence Timeout',
+            'Silence after speech before execute (≥0.45 keeps multi-word phrases together)',
+            'command-endpoint-silence',
+            0.25, 1.50, 0.05, 2,
+            recognitionGroup
+        );
+
+        this._prefsBuilder.createDoubleSpinButtonRow(
+            'Incomplete Phrase Wait',
+            'Seconds to merge split fragments like "open" + "firefox"',
+            'incomplete-phrase-wait',
+            0.5, 5.0, 0.1, 1,
+            recognitionGroup
+        );
+
+        this._prefsBuilder.createSwitchRow(
+            'GPU Acceleration',
+            'Prefer CUDA when Willow was built with GPU sherpa-onnx (falls back to CPU)',
+            'gpu-acceleration',
+            recognitionGroup
+        );
+
         page.add(recognitionGroup);
 
         // Interface Settings group
@@ -654,8 +677,8 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         this._prefsBuilder.createInfoRow(
             'Model Bundles',
             this._speakerVerificationEnabled
-                ? 'KWS handles hotword detection in normal mode. Streaming ASR powers command and typing modes. Speaker model enables voice verification.'
-                : 'KWS handles hotword detection in normal mode. Streaming ASR powers command and typing modes.',
+                ? 'KWS handles hotword detection. Silero VAD segments speech; Whisper transcribes commands and typing.'
+                : 'KWS handles hotword detection. Silero VAD segments speech; Whisper transcribes commands and typing.',
             infoGroup
         );
 

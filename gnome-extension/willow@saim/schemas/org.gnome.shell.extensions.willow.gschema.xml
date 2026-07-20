@@ -13,11 +13,23 @@
       <summary>Command recognition threshold</summary>
       <description>Minimum confidence percentage required to execute voice commands</description>
     </key>
-    <key name="processing-interval" type="d">
+    <key name="command-endpoint-silence" type="d">
+      <default>0.50</default>
+      <range min="0.25" max="1.50"/>
+      <summary>Command endpoint silence</summary>
+      <description>Seconds of silence after you stop speaking before the command is executed. Keep ≥0.45 so multi-word phrases are not split. Lower is faster but less accurate.</description>
+    </key>
+    <key name="incomplete-phrase-wait" type="d">
       <default>1.5</default>
       <range min="0.5" max="5.0"/>
-      <summary>Processing interval</summary>
-      <description>Time in seconds to wait before processing buffered speech</description>
+      <summary>Incomplete phrase wait</summary>
+      <description>How long to wait/merge fragments of a partial command like "open …" before giving up.</description>
+    </key>
+    <key name="processing-interval" type="d">
+      <default>0.50</default>
+      <range min="0.25" max="1.50"/>
+      <summary>Processing interval (legacy)</summary>
+      <description>Legacy alias for command-endpoint-silence</description>
     </key>
     <key name="hotword" type="s">
       <default>'hey willow'</default>
@@ -25,9 +37,9 @@
       <description>The word used to activate command mode from normal mode</description>
     </key>
     <key name="gpu-acceleration" type="b">
-      <default>false</default>
+      <default>true</default>
       <summary>GPU acceleration</summary>
-      <description>Enable GPU acceleration for whisper.cpp inference (requires GPU support)</description>
+      <description>Prefer CUDA when Willow was built with GPU sherpa-onnx (auto via deploy-dev.sh / makepkg). Falls back to CPU automatically.</description>
     </key>
   </schema>
 </schemalist>

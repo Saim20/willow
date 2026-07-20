@@ -258,7 +258,12 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     }
     
     _setupSettingsHandlers() {
-        const syncableKeys = ['command-threshold'];
+        const syncableKeys = [
+            'command-threshold',
+            'gpu-acceleration',
+            'command-endpoint-silence',
+            'incomplete-phrase-wait',
+        ];
         
         syncableKeys.forEach(key => {
             this._settings.connect(`changed::${key}`, () => {
@@ -277,7 +282,21 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         try {
             const threshold = this._settings.get_int('command-threshold') / 100.0;
             this._proxy.SetConfigValueRemote('command_threshold', new GLib.Variant('d', threshold));
-            console.log('Willow: Command threshold synced to service');
+            const provider = this._settings.get_boolean('gpu-acceleration') ? 'auto' : 'cpu';
+            this._proxy.SetConfigValueRemote('inference.provider', new GLib.Variant('s', provider));
+            const endpoint = this._settings.get_double('command-endpoint-silence');
+            this._proxy.SetConfigValueRemote(
+                'command_mode.endpoint_silence',
+                new GLib.Variant('d', endpoint)
+            );
+            // Keep legacy key in sync for older tooling.
+            this._settings.set_double('processing-interval', endpoint);
+            const incomplete = this._settings.get_double('incomplete-phrase-wait');
+            this._proxy.SetConfigValueRemote(
+                'command_mode.incomplete_hold',
+                new GLib.Variant('d', incomplete)
+            );
+            console.log('Willow: Settings synced to service');
         } catch (e) {
             console.error('Willow: Error syncing settings:', e);
         }

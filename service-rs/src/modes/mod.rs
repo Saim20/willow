@@ -1,33 +1,42 @@
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::commands::phrase_index::normalize;
 use crate::commands::CommandWorker;
 use crate::config::WillowConfig;
 use crate::pipeline::SpeechPipeline;
-use crate::types::{CommandDispatchResult, Mode, TranscriptionResult, TtsConfig};
-use crate::tts::TtsEngine;
+use crate::types::{CommandDispatchResult, Mode, TranscriptionResult};
+
+/// How long to wait for the rest of an incomplete command like "open …".
+const DEFAULT_INCOMPLETE_HOLD: Duration = Duration::from_millis(1500);
+/// Return to Normal after this much silence with no speech/commands.
+const DEFAULT_SESSION_IDLE: Duration = Duration::from_secs(12);
 
 pub struct ModeStateMachine {
     mode: Mode,
     buffer: String,
+    /// Prefix held when ASR endpointed mid-command (e.g. just "open").
+    incomplete_prefix: Option<String>,
+    incomplete_at: Option<Instant>,
+    last_activity: Option<Instant>,
     typing_last_typed: String,
     worker: CommandWorker,
-    tts: Arc<TtsEngine>,
-    tts_config: TtsConfig,
     typing_realtime: bool,
     typing_max_backspace: i32,
     typing_exit_phrases: Vec<String>,
+    incomplete_hold: Duration,
+    session_idle: Duration,
 }
 
 impl ModeStateMachine {
-    pub fn new(worker: CommandWorker, tts: Arc<TtsEngine>) -> Self {
+    pub fn new(worker: CommandWorker) -> Self {
         Self {
             mode: Mode::Normal,
             buffer: String::new(),
+            incomplete_prefix: None,
+            incomplete_at: None,
+            last_activity: None,
             typing_last_typed: String::new(),
             worker,
-            tts,
-            tts_config: TtsConfig::default(),
             typing_realtime: false,
             typing_max_backspace: 80,
             typing_exit_phrases: vec![
@@ -36,30 +45,64 @@ impl ModeStateMachine {
                 "normal mode".into(),
                 "go to normal mode".into(),
             ],
+            incomplete_hold: DEFAULT_INCOMPLETE_HOLD,
+            session_idle: DEFAULT_SESSION_IDLE,
         }
     }
 
     pub fn apply_config(&mut self, config: &WillowConfig) {
-        self.tts_config = config.tts_config();
         self.typing_realtime = config.typing_mode.realtime;
         self.typing_max_backspace = config.typing_mode.max_backspace;
         self.typing_exit_phrases = config.typing_mode.exit_phrases.clone();
-        self.tts.update_config(self.tts_config.clone());
+        self.incomplete_hold = Duration::from_secs_f32(
+            config.command_mode.incomplete_hold.clamp(0.3, 8.0),
+        );
+        self.session_idle =
+            Duration::from_secs_f32(config.command_mode.session_idle.clamp(3.0, 120.0));
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
     }
 
+    fn touch(&mut self) {
+        self.last_activity = Some(Instant::now());
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.buffer.clear();
         self.typing_last_typed.clear();
+        self.clear_incomplete();
+        if matches!(mode, Mode::Command | Mode::Typing) {
+            self.touch();
+        } else {
+            self.last_activity = None;
+        }
     }
 
     pub fn set_mode_with_pipeline(&mut self, mode: Mode, pipeline: &mut SpeechPipeline) {
         self.set_mode(mode);
         pipeline.set_mode(mode);
+    }
+
+    /// Exit Command/Typing after prolonged inactivity.
+    pub fn tick_idle(&mut self, pipeline: &mut SpeechPipeline) -> Option<ModeChange> {
+        if !matches!(self.mode, Mode::Command | Mode::Typing) {
+            return None;
+        }
+        let idle = self
+            .last_activity
+            .is_some_and(|t| t.elapsed() > self.session_idle);
+        if !idle {
+            return None;
+        }
+        let old = self.mode;
+        self.set_mode_with_pipeline(Mode::Normal, pipeline);
+        Some(ModeChange {
+            new_mode: Mode::Normal,
+            old_mode: old,
+        })
     }
 
     pub fn buffer(&self) -> &str {
@@ -73,20 +116,19 @@ impl ModeStateMachine {
     ) -> Option<ModeChange> {
         match keyword {
             "command" | "normal" | "typing" => {
-                if keyword == "command" && !pipeline.ready_for_command() {
-                    if self.tts_config.errors {
-                        self.tts
-                            .speak("Speech recognition is not available");
-                    }
+                if matches!(keyword, "command" | "typing") && !pipeline.ready_for_command() {
                     return None;
                 }
                 let new_mode = Mode::from_str(keyword);
                 let old = self.mode;
                 if new_mode != old {
                     self.set_mode_with_pipeline(new_mode, pipeline);
-                    self.speak_mode(new_mode);
-                    return Some(ModeChange { new_mode, old_mode: old });
+                    return Some(ModeChange {
+                        new_mode,
+                        old_mode: old,
+                    });
                 }
+                self.touch();
                 None
             }
             _ => None,
@@ -103,13 +145,34 @@ impl ModeStateMachine {
         }
 
         self.buffer = result.text.clone();
+        self.touch();
 
         match self.mode {
             Mode::Command => {
                 if result.is_endpoint {
-                    let dispatch = pipeline.resolver.process_endpoint(&result.text);
+                    let text = self.merge_with_incomplete(&result.text);
+                    if text.is_empty() {
+                        pipeline.reset_listening();
+                        return None;
+                    }
+                    // Hold bare prefixes before resolving — process_endpoint records history.
+                    if is_incomplete_command(&text) {
+                        self.incomplete_prefix = Some(text);
+                        self.incomplete_at = Some(Instant::now());
+                        pipeline.reset_listening();
+                        return None;
+                    }
+                    let dispatch = pipeline.resolver.process_endpoint(&text);
+                    // Hold 1–2 word scraps that didn't match so the next chunk can merge.
+                    if should_hold_short_fragment(&text, dispatch.handled) {
+                        self.incomplete_prefix = Some(text);
+                        self.incomplete_at = Some(Instant::now());
+                        pipeline.reset_listening();
+                        return None;
+                    }
+                    self.clear_incomplete();
                     self.dispatch_command(dispatch, pipeline);
-                    pipeline.asr.reset_stream();
+                    pipeline.reset_listening();
                 }
                 None
             }
@@ -118,7 +181,6 @@ impl ModeStateMachine {
                 if self.check_exit_phrases(&text) {
                     let old = self.mode;
                     self.set_mode_with_pipeline(Mode::Normal, pipeline);
-                    self.speak_mode(Mode::Normal);
                     return Some(ModeChange {
                         new_mode: Mode::Normal,
                         old_mode: old,
@@ -127,7 +189,7 @@ impl ModeStateMachine {
                 if result.is_final || result.is_endpoint {
                     self.commit_typing_phrase(&text);
                     self.typing_last_typed.clear();
-                    pipeline.asr.reset_stream();
+                    pipeline.reset_listening();
                 } else if self.typing_realtime {
                     self.apply_typing_delta(&text);
                 }
@@ -137,21 +199,42 @@ impl ModeStateMachine {
         }
     }
 
+    fn merge_with_incomplete(&mut self, text: &str) -> String {
+        let expired = self
+            .incomplete_at
+            .is_some_and(|t| t.elapsed() > self.incomplete_hold);
+        if expired {
+            self.clear_incomplete();
+        }
+        let norm = normalize(text);
+        match self.incomplete_prefix.take() {
+            Some(prefix) if !norm.is_empty() => {
+                self.incomplete_at = None;
+                if norm.starts_with(&prefix) {
+                    norm
+                } else {
+                    format!("{prefix} {norm}")
+                }
+            }
+            Some(prefix) => {
+                self.incomplete_prefix = Some(prefix.clone());
+                prefix
+            }
+            None => norm,
+        }
+    }
+
+    fn clear_incomplete(&mut self) {
+        self.incomplete_prefix = None;
+        self.incomplete_at = None;
+    }
+
     fn dispatch_command(&mut self, result: CommandDispatchResult, pipeline: &mut SpeechPipeline) {
         if !result.handled {
-            if result.pending {
-                return;
-            }
-            if self.tts_config.errors {
-                self.tts.speak("Sorry, I didn't understand that");
-            }
             return;
         }
 
-        if result.command_action.is_empty()
-            && !result.is_search
-            && !result.is_smart_open
-        {
+        if result.command_action.is_empty() && !result.is_search && !result.is_smart_open {
             return;
         }
 
@@ -161,7 +244,6 @@ impl ModeStateMachine {
                 result.search_query,
                 result.matched_phrase,
                 result.confidence,
-                self.tts_config.search_executed,
             );
             return;
         }
@@ -171,20 +253,16 @@ impl ModeStateMachine {
                 result.app_name,
                 result.matched_phrase,
                 result.confidence,
-                self.tts_config.command_executed,
-                self.tts_config.errors,
             );
             return;
         }
 
         if result.command_action == "exit_command_mode" {
             self.set_mode_with_pipeline(Mode::Normal, pipeline);
-            self.speak_mode(Mode::Normal);
             return;
         }
         if result.command_action == "start_typing_mode" {
             self.set_mode_with_pipeline(Mode::Typing, pipeline);
-            self.speak_mode(Mode::Typing);
             return;
         }
 
@@ -192,21 +270,7 @@ impl ModeStateMachine {
             result.command_action,
             result.matched_phrase,
             result.confidence,
-            self.tts_config.command_executed,
-            self.tts_config.errors,
         );
-    }
-
-    fn speak_mode(&self, mode: Mode) {
-        if self.tts_config.mode_changed {
-            self.tts.speak(&format!("{} mode", mode.as_str()));
-        }
-    }
-
-    pub fn speak_speaker_rejected(&self) {
-        if self.tts_config.errors {
-            self.tts.speak("Voice not recognized");
-        }
     }
 
     fn check_exit_phrases(&self, text: &str) -> bool {
@@ -216,7 +280,6 @@ impl ModeStateMachine {
         })
     }
 
-    /// Type a completed phrase once (default typing path — no partial churn).
     fn commit_typing_phrase(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -233,7 +296,6 @@ impl ModeStateMachine {
         }
     }
 
-    /// Realtime path: word-aligned diff so ASR revisions backspace correctly.
     fn apply_typing_delta(&mut self, new_text: &str) {
         if new_text == self.typing_last_typed {
             return;
@@ -250,12 +312,32 @@ impl ModeStateMachine {
     }
 }
 
-/// Lowercase + normalized whitespace for typed output.
 fn format_for_typing(text: &str) -> String {
     normalize(text)
 }
 
-/// Characters to backspace and text to type after a word-aligned diff.
+fn is_incomplete_command(text: &str) -> bool {
+    let norm = normalize(text);
+    if norm.is_empty() {
+        return false;
+    }
+    matches!(norm.as_str(), "open" | "launch" | "start" | "search")
+        || norm.ends_with(" for")
+        || ["open", "launch", "start", "search"]
+            .iter()
+            .any(|t| norm == format!("{t} the") || norm == format!("{t} a"))
+}
+
+/// Hold 1–2 word scraps that didn't match a command so the next VAD chunk can merge.
+fn should_hold_short_fragment(text: &str, handled: bool) -> bool {
+    if handled {
+        return false;
+    }
+    let norm = normalize(text);
+    let words = norm.split_whitespace().count();
+    matches!(words, 1 | 2)
+}
+
 fn typing_word_delta(old: &str, new: &str, max_backspace: i32) -> (usize, String) {
     if new.is_empty() {
         return (0, String::new());
@@ -296,7 +378,6 @@ fn typing_word_delta(old: &str, new: &str, max_backspace: i32) -> (usize, String
     (capped, to_type)
 }
 
-/// Suffix of `new` not already covered by `old` when both describe the same utterance.
 fn typing_suffix_after(old: &str, new: &str) -> String {
     if old.is_empty() {
         return new.to_string();
@@ -344,9 +425,17 @@ mod tests {
 
     #[test]
     fn commit_suffix_after_partial() {
-        assert_eq!(
-            typing_suffix_after("hello wor", "hello world"),
-            "ld"
-        );
+        assert_eq!(typing_suffix_after("hello wor", "hello world"), "ld");
+    }
+
+    #[test]
+    fn incomplete_open_detected() {
+        assert!(is_incomplete_command("open"));
+        assert!(is_incomplete_command("Open"));
+        assert!(is_incomplete_command("launch"));
+        assert!(is_incomplete_command("search google for"));
+        assert!(!is_incomplete_command("open firefox"));
+        assert!(!is_incomplete_command("start typing"));
+        assert!(!is_incomplete_command("exit"));
     }
 }

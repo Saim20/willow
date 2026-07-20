@@ -62,10 +62,6 @@ export const VoiceAssistantIface = `
     <signal name="SpeakerVerificationFailed">
       <arg name="reason" type="s"/>
     </signal>
-    <signal name="TtsStarted">
-      <arg name="text" type="s"/>
-    </signal>
-    <signal name="TtsFinished"/>
     <method name="StartSpeakerEnrollment"/>
     <method name="CancelSpeakerEnrollment"/>
     <method name="GetSpeakerEnrollmentStatus">

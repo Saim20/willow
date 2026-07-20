@@ -5,6 +5,13 @@ edition = "2021"
 description = "Willow offline voice assistant D-Bus service"
 license = "MIT"
 
+[features]
+default = ["cpu"]
+# CPU-only prebuilt sherpa-onnx (default crates.io static libs).
+cpu = ["sherpa-onnx/static"]
+# Link against shared sherpa-onnx + CUDA onnxruntime (auto via deploy-dev.sh / PKGBUILD when CUDA is present).
+cuda = ["sherpa-onnx/shared"]
+
 [dependencies]
 anyhow = "1"
 dirs = "6"
@@ -13,7 +20,7 @@ libpulse-simple-binding = "2.29"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sherpa-onnx = "1.13"
+sherpa-onnx = { version = "1.13", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

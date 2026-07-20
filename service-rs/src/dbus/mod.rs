@@ -226,12 +226,6 @@ impl WillowDBus {
         reason: &str,
     ) -> zbus::Result<()>;
 
-    #[zbus(signal, name = "TtsStarted")]
-    async fn tts_started(emitter: &SignalEmitter<'_>, text: &str) -> zbus::Result<()>;
-
-    #[zbus(signal, name = "TtsFinished")]
-    async fn tts_finished(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
-
     #[zbus(signal, name = "CommandExecuted")]
     async fn command_executed(
         emitter: &SignalEmitter<'_>,

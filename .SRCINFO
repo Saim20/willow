@@ -1,23 +1,23 @@
 pkgbase = willow
 	pkgdesc = Simple offline configurable voice assistant for gnome
 	pkgver = 3.0.0
-	pkgrel = 3
+	pkgrel = 5
 	url = https://github.com/Saim20/willow
 	install = willow.install
 	arch = x86_64
 	license = MIT
-	makedepends = cmake
-	makedepends = git
-	makedepends = gcc
+	makedepends = rust
+	makedepends = cargo
 	makedepends = glib2
+	makedepends = bzip2
 	depends = gnome-shell>=45
-	depends = sdbus-cpp
-	depends = jsoncpp
 	depends = libpulse
 	depends = ydotool
 	depends = curl
-	optdepends = speech-dispatcher: TTS feedback via spd-say
-	optdepends = espeak: TTS fallback when speech-dispatcher is unavailable
+	optdepends = cuda: build/run with GPU-accelerated sherpa-onnx
+	optdepends = cudnn: required with cuda for GPU builds
+	optdepends = python-sentencepiece: encode custom KWS keywords at install/runtime
+	optdepends = nvidia-utils: NVIDIA driver userspace for CUDA
 	options = !debug
 	source = willow::git+https://github.com/Saim20/willow.git#tag=v3.0.0
 	sha256sums = SKIP
