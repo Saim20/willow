@@ -4,14 +4,14 @@ use tracing::{error, info, warn};
 
 use super::kws::{KeywordsSource, KwsEngine};
 use super::speaker::SpeakerVerifier;
+use super::stream_asr::StreamAsrEngine;
 use super::vad::VadEngine;
 use super::whisper::WhisperEngine;
 use crate::audio::{Agc, AudioRouter};
 use crate::commands::phrase_index::kws_keyword_matches;
-use crate::commands::CommandIntentResolver;
 use crate::config::WillowConfig;
 use crate::models::ModelPaths;
-use crate::types::Mode;
+use crate::types::{Mode, TranscriptionResult};
 
 /// Side effects produced while processing one audio chunk (no re-entrant callbacks).
 #[derive(Debug, Default)]
@@ -20,17 +20,19 @@ pub struct PipelineEvents {
     pub keywords: Vec<String>,
     pub speaker_fails: Vec<String>,
     pub command_pending: Vec<(String, bool)>,
-    /// Completed VAD segments — transcribe **outside** the service mutex.
+    /// Typing-mode VAD segments — Whisper outside the service mutex.
     pub speech_segments: Vec<Vec<f32>>,
+    /// Command-mode streaming ASR updates (partials / endpoints).
+    pub stream_results: Vec<TranscriptionResult>,
 }
 
 pub struct SpeechPipeline {
     pub kws: KwsEngine,
     pub vad: VadEngine,
+    pub stream_asr: StreamAsrEngine,
     pub whisper: Arc<WhisperEngine>,
     pub speaker: SpeakerVerifier,
     pub router: AudioRouter,
-    pub resolver: CommandIntentResolver,
     agc: Agc,
     last_chunk: Vec<f32>,
     mode: Mode,
@@ -38,18 +40,19 @@ pub struct SpeechPipeline {
     config: WillowConfig,
     kws_ready: bool,
     asr_ready: bool,
+    stream_ready: bool,
     init_error: Option<String>,
 }
 
 impl SpeechPipeline {
-    pub fn new(paths: ModelPaths, resolver: CommandIntentResolver) -> Self {
+    pub fn new(paths: ModelPaths) -> Self {
         Self {
             kws: KwsEngine::new(paths.clone()),
             vad: VadEngine::new(paths.clone()),
+            stream_asr: StreamAsrEngine::new(paths.clone()),
             whisper: Arc::new(WhisperEngine::new(paths.clone())),
             speaker: SpeakerVerifier::new(&paths),
             router: AudioRouter::new(),
-            resolver,
             agc: Agc::new(),
             last_chunk: Vec::new(),
             mode: Mode::Normal,
@@ -57,6 +60,7 @@ impl SpeechPipeline {
             config: WillowConfig::default(),
             kws_ready: false,
             asr_ready: false,
+            stream_ready: false,
             init_error: None,
         }
     }
@@ -92,7 +96,16 @@ impl SpeechPipeline {
             )
             .is_ok();
 
-        // WhisperEngine behind Arc — re-create for init.
+        let stream_ok = self
+            .stream_asr
+            .initialize(
+                provider,
+                threads,
+                config.streaming_asr.rule1_min_trailing_silence,
+                config.streaming_asr.rule2_min_trailing_silence,
+            )
+            .is_ok();
+
         let mut whisper = WhisperEngine::new(ModelPaths::from_home());
         let whisper_ok = match whisper.initialize(provider, threads) {
             Ok(()) => true,
@@ -103,13 +116,16 @@ impl SpeechPipeline {
         };
         self.whisper = Arc::new(whisper);
 
-        if kws_ok && (!vad_ok || !whisper_ok) {
+        if kws_ok && (!vad_ok || !whisper_ok || !stream_ok) {
             let mut parts = Vec::new();
             if !vad_ok {
                 parts.push("VAD model not found");
             }
             if !whisper_ok {
                 parts.push("Whisper model not found");
+            }
+            if !stream_ok {
+                parts.push("Streaming ASR model not found (asr-stream)");
             }
             let msg = parts.join("; ");
             self.init_error = Some(
@@ -133,18 +149,22 @@ impl SpeechPipeline {
             .set_threshold(config.speaker_verification.threshold);
         self.speaker
             .set_enrolled_user(&config.speaker_verification.enrolled_user);
-        self.resolver
-            .set_threshold(config.command_threshold_fraction());
-        self.resolver.set_commands(config.commands.clone());
 
         self.kws_ready = kws_ok;
         self.asr_ready = self.vad.is_loaded() && self.whisper.is_loaded();
+        self.stream_ready = self.stream_asr.is_loaded();
         if config.speaker_verification.enabled && !speaker_ok {
             error!("Speaker model unavailable");
         }
+        if self.stream_ready {
+            info!(
+                "Command streaming ASR ready (provider={})",
+                self.stream_asr.provider()
+            );
+        }
         if self.asr_ready {
             info!(
-                "Command ASR ready (VAD + Whisper, provider={})",
+                "Typing ASR ready (VAD + Whisper, provider={})",
                 self.whisper.provider()
             );
         }
@@ -155,7 +175,13 @@ impl SpeechPipeline {
         self.kws_ready
     }
 
+    /// Command mode needs streaming ASR (partials + early fire).
     pub fn ready_for_command(&self) -> bool {
+        self.kws_ready && self.stream_ready
+    }
+
+    /// Typing / dictation needs offline Whisper + VAD.
+    pub fn ready_for_typing(&self) -> bool {
         self.kws_ready && self.asr_ready
     }
 
@@ -167,6 +193,10 @@ impl SpeechPipeline {
         self.asr_ready
     }
 
+    pub fn stream_ready(&self) -> bool {
+        self.stream_ready
+    }
+
     pub fn whisper_ready(&self) -> bool {
         self.whisper.is_loaded()
     }
@@ -176,7 +206,11 @@ impl SpeechPipeline {
     }
 
     pub fn active_provider(&self) -> &str {
-        self.whisper.provider()
+        if self.stream_ready {
+            self.stream_asr.provider()
+        } else {
+            self.whisper.provider()
+        }
     }
 
     pub fn init_error(&self) -> Option<&str> {
@@ -189,28 +223,40 @@ impl SpeechPipeline {
 
     pub fn reset_listening(&mut self) {
         self.vad.reset();
+        self.stream_asr.reset();
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.vad.reset();
+        self.stream_asr.reset();
         match mode {
             Mode::Normal => {
                 self.vad.set_enabled(false);
+                self.stream_asr.set_enabled(false);
                 self.kws.set_enabled(true);
             }
             Mode::Command => {
                 self.kws.set_enabled(true);
+                // VAD+Whisper for search (and other utterance finals); stream for live HUD / early commands.
                 if self.asr_ready {
-                    self.vad
-                        .set_min_silence(self.config.command_mode.endpoint_silence);
+                    // Slightly longer than bare command silence so search queries finish cleanly.
+                    let silence = self
+                        .config
+                        .command_mode
+                        .endpoint_silence
+                        .max(0.45)
+                        .min(1.2);
+                    self.vad.set_min_silence(silence);
                     self.vad.set_enabled(true);
                 } else {
                     self.vad.set_enabled(false);
                 }
+                self.stream_asr.set_enabled(self.stream_ready);
             }
             Mode::Typing => {
                 self.kws.set_enabled(true);
+                self.stream_asr.set_enabled(false);
                 if self.asr_ready {
                     self.vad
                         .set_min_silence(self.config.streaming_asr.endpoint_silence_typing);
@@ -225,6 +271,14 @@ impl SpeechPipeline {
     pub fn apply_config(&mut self, config: &WillowConfig) -> Result<()> {
         let provider_changed = config.inference.provider != self.config.inference.provider
             || config.inference.num_threads != self.config.inference.num_threads;
+        let stream_timing_changed = (config.streaming_asr.rule1_min_trailing_silence
+            - self.config.streaming_asr.rule1_min_trailing_silence)
+            .abs()
+            > 0.01
+            || (config.streaming_asr.rule2_min_trailing_silence
+                - self.config.streaming_asr.rule2_min_trailing_silence)
+                .abs()
+                > 0.01;
         let cmd_timing_changed = (config.command_mode.endpoint_silence
             - self.config.command_mode.endpoint_silence)
             .abs()
@@ -240,9 +294,6 @@ impl SpeechPipeline {
         self.speaker.set_enabled(config.speaker_verification.enabled);
         self.speaker
             .set_threshold(config.speaker_verification.threshold);
-        self.resolver
-            .set_threshold(config.command_threshold_fraction());
-        self.resolver.set_commands(config.commands.clone());
 
         let provider = &config.inference.provider;
         let threads = config.inference.num_threads;
@@ -260,34 +311,43 @@ impl SpeechPipeline {
                 provider,
                 threads,
             );
-            if provider_changed {
-                let mut whisper = WhisperEngine::new(ModelPaths::from_home());
-                let whisper_ok = whisper.initialize(provider, threads).is_ok();
-                self.whisper = Arc::new(whisper);
-                self.asr_ready = self.vad.is_loaded() && whisper_ok;
-                if config.speaker_verification.enabled {
-                    let _ = self
-                        .speaker
-                        .initialize(&ModelPaths::from_home(), provider, threads);
-                }
-            } else {
-                self.asr_ready = self.vad.is_loaded() && self.whisper.is_loaded();
-            }
         }
+        if provider_changed || stream_timing_changed {
+            let _ = self.stream_asr.initialize(
+                provider,
+                threads,
+                config.streaming_asr.rule1_min_trailing_silence,
+                config.streaming_asr.rule2_min_trailing_silence,
+            );
+        }
+        if provider_changed {
+            let mut whisper = WhisperEngine::new(ModelPaths::from_home());
+            let whisper_ok = whisper.initialize(provider, threads).is_ok();
+            self.whisper = Arc::new(whisper);
+            self.asr_ready = self.vad.is_loaded() && whisper_ok;
+            if config.speaker_verification.enabled {
+                let _ = self
+                    .speaker
+                    .initialize(&ModelPaths::from_home(), provider, threads);
+            }
+        } else {
+            self.asr_ready = self.vad.is_loaded() && self.whisper.is_loaded();
+        }
+        self.stream_ready = self.stream_asr.is_loaded();
+
         if !kws_ok {
             self.init_error = self
                 .kws
                 .init_error()
                 .map(|s| s.to_string())
                 .or_else(|| Some("KWS re-initialization failed".into()));
-        } else if self.asr_ready {
+        } else if self.stream_ready || self.asr_ready {
             self.init_error = None;
         }
         Ok(())
     }
 
-    /// AGC + KWS + VAD only. Whisper runs later via [`Self::whisper_handle`] so the
-    /// service mutex is not held during GPU/CPU ASR.
+    /// AGC + KWS + streaming ASR (command) or VAD (typing). Whisper runs later for typing.
     pub fn process_audio(&mut self, chunk: &[f32]) -> PipelineEvents {
         let mut events = PipelineEvents::default();
 
@@ -305,15 +365,34 @@ impl SpeechPipeline {
             }
         }
 
-        if matches!(self.mode, Mode::Command | Mode::Typing) {
-            if self.asr_ready {
-                let raw = self.vad.process_audio(&chunk);
-                let preroll = self.config.command_mode.preroll;
-                events.speech_segments = raw
-                    .into_iter()
-                    .map(|seg| self.with_preroll(seg, preroll))
-                    .collect();
+        match self.mode {
+            Mode::Command => {
+                if self.stream_ready {
+                    if let Some(result) = self.stream_asr.process_audio(&chunk) {
+                        events.stream_results.push(result);
+                    }
+                }
+                // Parallel VAD for Whisper search (and other) finals.
+                if self.asr_ready && self.vad.is_loaded() {
+                    let raw = self.vad.process_audio(&chunk);
+                    let preroll = self.config.command_mode.preroll;
+                    events.speech_segments = raw
+                        .into_iter()
+                        .map(|seg| self.with_preroll(seg, preroll))
+                        .collect();
+                }
             }
+            Mode::Typing => {
+                if self.asr_ready {
+                    let raw = self.vad.process_audio(&chunk);
+                    let preroll = self.config.command_mode.preroll;
+                    events.speech_segments = raw
+                        .into_iter()
+                        .map(|seg| self.with_preroll(seg, preroll))
+                        .collect();
+                }
+            }
+            Mode::Normal => {}
         }
         events
     }
@@ -322,7 +401,6 @@ impl SpeechPipeline {
         self.config.command_mode.whisper_pre_pad
     }
 
-    /// Prepend audio from just before VAD onset so short leading words are not clipped.
     fn with_preroll(&self, segment: Vec<f32>, preroll_secs: f32) -> Vec<f32> {
         if preroll_secs <= 0.0 || segment.is_empty() {
             return segment;
@@ -352,6 +430,7 @@ impl SpeechPipeline {
     fn handle_keyword_detected(&mut self, keyword: &str, events: &mut PipelineEvents) {
         if self.is_mode_control_keyword(keyword) {
             self.vad.reset();
+            self.stream_asr.reset();
             if let Some(action) = self.mode_keyword_action(keyword) {
                 events.keywords.push(action);
             }
@@ -427,20 +506,21 @@ impl SpeechPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::CommandIntentResolver;
-    use std::sync::Arc;
-
-    fn empty_pipeline() -> SpeechPipeline {
-        SpeechPipeline::new(
-            ModelPaths::from_home(),
-            CommandIntentResolver::new(Arc::new(crate::commands::CommandExecutor::new())),
-        )
-    }
 
     #[test]
     fn readiness_gates() {
-        let p = empty_pipeline();
+        let p = SpeechPipeline::new(ModelPaths::from_home());
         assert!(!p.ready_for_normal());
         assert!(!p.ready_for_command());
+        assert!(!p.ready_for_typing());
+    }
+
+    #[test]
+    fn command_mode_does_not_emit_whisper_segments_without_stream() {
+        let mut p = SpeechPipeline::new(ModelPaths::from_home());
+        p.set_mode(Mode::Command);
+        let events = p.process_audio(&[0.0f32; 1600]);
+        assert!(events.speech_segments.is_empty());
+        assert!(events.stream_results.is_empty());
     }
 }

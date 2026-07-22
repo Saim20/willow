@@ -7,7 +7,7 @@ Offline voice assistant for GNOME. Uses [sherpa-onnx](https://github.com/k2-fsa/
 - GNOME Shell 45+
 - PulseAudio or PipeWire
 - [ydotool](https://github.com/ReimuNotMoe/ydotool) (typing mode and key commands)
-- Optional: NVIDIA GPU + `cuda` + `cudnn` packages (auto-detected at build/install)
+- Optional: NVIDIA GPU + `cuda` + `cudnn` (matched to your toolkit — CUDA 13 uses Microsoft ORT cuda13 + a local sherpa build; no CUDA 12 wheel fallback)
 
 ## Install (AUR / makepkg)
 
@@ -18,7 +18,7 @@ git clone https://github.com/Saim20/willow.git && cd willow
 makepkg -si
 ```
 
-If `cuda` and `cudnn` are installed, the package builds with GPU sherpa-onnx automatically. After install, `willow.install`:
+If `cuda` and `cudnn` are installed, the package builds with GPU sherpa-onnx automatically (native to your CUDA major). After install, `willow.install`:
 
 - Creates `~/.config/willow/`
 - Downloads speech models (~210 MB)

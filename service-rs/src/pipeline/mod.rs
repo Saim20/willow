@@ -1,6 +1,7 @@
 pub mod kws;
 pub mod provider;
 pub mod speaker;
+pub mod stream_asr;
 pub mod vad;
 pub mod whisper;
 

@@ -74,6 +74,35 @@ impl CommandExecutor {
         &self.context
     }
 
+    /// Known from context aliases / defaults (does not require the binary on PATH).
+    pub fn is_known_app(&self, app_name: &str) -> bool {
+        let lower = app_name.to_lowercase();
+        if self.context.default_apps.contains_key(&lower)
+            || self.context.app_aliases.contains_key(&lower)
+        {
+            return true;
+        }
+        if self
+            .context
+            .default_apps
+            .values()
+            .any(|v| v.eq_ignore_ascii_case(&lower))
+        {
+            return true;
+        }
+        self.context.app_aliases.values().any(|aliases| {
+            aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&lower))
+        })
+    }
+
+    pub fn is_known_engine(&self, engine: &str) -> bool {
+        self.context
+            .search_engines
+            .contains_key(&engine.to_lowercase())
+    }
+
     pub fn load_context(&mut self, path: &std::path::Path) -> Result<()> {
         if !path.is_file() {
             return Ok(());

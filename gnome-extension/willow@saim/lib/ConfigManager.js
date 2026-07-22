@@ -143,7 +143,6 @@ export class ConfigManager {
     syncSettingsToConfig() {
         const config = this.getConfig();
         
-        // Update basic settings
         config.hotword = this._settings.get_string('hotword');
         config.command_threshold = this._settings.get_int('command-threshold');
         if (!config.inference) {
@@ -154,14 +153,38 @@ export class ConfigManager {
             config.command_mode = {};
         }
         config.command_mode.endpoint_silence = this._settings.get_double('command-endpoint-silence');
-        config.command_mode.incomplete_hold = this._settings.get_double('incomplete-phrase-wait');
+        delete config.command_mode.incomplete_hold;
+        delete config.command_mode.eager_endpoint;
+        if (!config.workflows) {
+            config.workflows = {};
+        }
+        config.workflows.session_timeout = this._settings.get_double('workflow-session-timeout');
+        if (!config.intent) {
+            config.intent = {};
+        }
+        config.intent.early_fire = this._settings.get_boolean('early-fire');
+        const llmEnabled = this._settings.get_boolean('llm-enabled');
+        config.intent.llm_fallback = llmEnabled;
+        if (!config.inference.llm) {
+            config.inference.llm = {};
+        }
+        config.inference.llm.enabled = llmEnabled;
+        config.inference.llm.model_path = this._settings.get_string('llm-model-path');
+        config.inference.llm.max_tokens = this._settings.get_int('llm-max-tokens');
+        config.inference.llm.timeout_ms = this._settings.get_int('llm-timeout-ms');
+        if (!config.typing_mode) {
+            config.typing_mode = {};
+        }
+        config.typing_mode.auto_revert = this._settings.get_boolean('typing-auto-revert');
+        delete config.typing_mode.check_recent_chars;
         if (!config.streaming_asr) {
             config.streaming_asr = {};
         }
-        config.streaming_asr.endpoint_silence_command = config.command_mode.endpoint_silence;
-        this._settings.set_double('processing-interval', config.command_mode.endpoint_silence);
+        delete config.streaming_asr.endpoint_silence_command;
+        // Keep rule2 aligned with the silence knob.
+        config.streaming_asr.rule2_min_trailing_silence =
+            Math.min(1.5, Math.max(0.3, config.command_mode.endpoint_silence * 2.0));
 
-        // Persist locally only; push hotword via Apply button, threshold via SetConfigValue.
         return this.saveConfig(config, false);
     }
 
@@ -173,12 +196,36 @@ export class ConfigManager {
         
         this._settings.set_string('hotword', config.hotword || 'hey willow');
         this._settings.set_int('command-threshold', config.command_threshold || 80);
-        const endpoint = config.command_mode?.endpoint_silence ?? 0.35;
+        const endpoint = config.command_mode?.endpoint_silence
+            ?? config.streaming_asr?.rule2_min_trailing_silence / 2
+            ?? 0.30;
         this._settings.set_double('command-endpoint-silence', endpoint);
-        this._settings.set_double('processing-interval', endpoint);
         this._settings.set_double(
-            'incomplete-phrase-wait',
-            config.command_mode?.incomplete_hold ?? 1.2
+            'workflow-session-timeout',
+            config.workflows?.session_timeout ?? 12.0
+        );
+        this._settings.set_boolean(
+            'early-fire',
+            config.intent?.early_fire ?? true
+        );
+        const llmEnabled = (config.inference?.llm?.enabled ?? false)
+            || (config.intent?.llm_fallback ?? false);
+        this._settings.set_boolean('llm-enabled', llmEnabled);
+        this._settings.set_string(
+            'llm-model-path',
+            config.inference?.llm?.model_path ?? ''
+        );
+        this._settings.set_int(
+            'llm-max-tokens',
+            config.inference?.llm?.max_tokens ?? 64
+        );
+        this._settings.set_int(
+            'llm-timeout-ms',
+            config.inference?.llm?.timeout_ms ?? 400
+        );
+        this._settings.set_boolean(
+            'typing-auto-revert',
+            config.typing_mode?.auto_revert ?? false
         );
         if (config.inference?.provider) {
             this._settings.set_boolean(
@@ -328,6 +375,28 @@ export class ConfigManager {
                 "threshold": 0.65,
                 "enrolled_user": "owner"
             },
+            "streaming_asr": {
+                "endpoint_silence_typing": 0.45,
+                "rule1_min_trailing_silence": 2.4,
+                "rule2_min_trailing_silence": 0.6
+            },
+            "intent": {
+                "early_fire": true,
+                "llm_fallback": false
+            },
+            "workflows": {
+                "session_timeout": 12.0
+            },
+            "inference": {
+                "provider": "auto",
+                "num_threads": 0,
+                "llm": {
+                    "enabled": false,
+                    "model_path": "",
+                    "max_tokens": 64,
+                    "timeout_ms": 400
+                }
+            },
             "commands": [],
             "typing_mode": {
                 "exit_phrases": [
@@ -336,7 +405,7 @@ export class ConfigManager {
                     "normal mode",
                     "go to normal mode"
                 ],
-                "check_recent_chars": 100
+                "auto_revert": false
             }
         };
     }

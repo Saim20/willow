@@ -65,8 +65,9 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         });
 
         proxy.connectSignal('Notification', (_proxy, _sender, [title, message]) => {
-            this._showToast(window, `${title}: ${message}`, 5);
+            // No banners — status refresh only if needed.
             this._refreshVoicePageStatus();
+            console.log(`Willow: ${title}: ${message}`);
         });
 
         proxy.connectSignal('StatusChanged', () => {
@@ -110,17 +111,31 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
 
         this._prefsBuilder.createDoubleSpinButtonRow(
             'Command Silence Timeout',
-            'Silence after speech before execute (≥0.45 keeps multi-word phrases together)',
+            'Streaming ASR trailing silence (rule2) — lower closes utterances sooner',
             'command-endpoint-silence',
-            0.25, 1.50, 0.05, 2,
+            0.15, 1.50, 0.05, 2,
             recognitionGroup
         );
 
         this._prefsBuilder.createDoubleSpinButtonRow(
-            'Incomplete Phrase Wait',
-            'Seconds to merge split fragments like "open" + "firefox"',
-            'incomplete-phrase-wait',
-            0.5, 5.0, 0.1, 1,
+            'Workflow Session Timeout',
+            'Seconds to wait for missing slots (e.g. “Open which app?”) before clearing',
+            'workflow-session-timeout',
+            2.0, 60.0, 1.0, 0,
+            recognitionGroup
+        );
+
+        this._prefsBuilder.createSwitchRow(
+            'Early Command Fire',
+            'Run exact phrases as soon as streaming ASR matches (recommended)',
+            'early-fire',
+            recognitionGroup
+        );
+
+        this._prefsBuilder.createSwitchRow(
+            'Typing Mode Auto-Revert',
+            'Return to normal after idle timeout (off = stay in typing until exit phrase)',
+            'typing-auto-revert',
             recognitionGroup
         );
 
@@ -132,6 +147,44 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         );
 
         page.add(recognitionGroup);
+
+        const llmGroup = this._prefsBuilder.createGroup(
+            'Local LLM Fallback',
+            'Optional llama-cli + GGUF for ambiguous phrasing after endpoint (default off)'
+        );
+
+        this._prefsBuilder.createSwitchRow(
+            'Enable LLM Fallback',
+            'Rewrite unmatched utterances to structured intents (never free-form shell)',
+            'llm-enabled',
+            llmGroup
+        );
+
+        this._prefsBuilder.createEntryRow(
+            'GGUF Model Path',
+            'Absolute path to a local .gguf model for llama-cli',
+            'llm-model-path',
+            '',
+            llmGroup
+        );
+
+        this._prefsBuilder.createSpinButtonRow(
+            'Max Tokens',
+            'Cap LLM output length (16–256)',
+            'llm-max-tokens',
+            16, 256, 8,
+            llmGroup
+        );
+
+        this._prefsBuilder.createSpinButtonRow(
+            'Timeout (ms)',
+            'Hard timeout for LLM fallback (100–5000)',
+            'llm-timeout-ms',
+            100, 5000, 50,
+            llmGroup
+        );
+
+        page.add(llmGroup);
 
         // Interface Settings group
         const interfaceGroup = this._prefsBuilder.createGroup(
@@ -677,8 +730,8 @@ export default class VoiceAssistantExtensionPreferences extends ExtensionPrefere
         this._prefsBuilder.createInfoRow(
             'Model Bundles',
             this._speakerVerificationEnabled
-                ? 'KWS handles hotword detection. Silero VAD segments speech; Whisper transcribes commands and typing.'
-                : 'KWS handles hotword detection. Silero VAD segments speech; Whisper transcribes commands and typing.',
+                ? 'KWS wakes Willow. Streaming ASR drives command partials and early fire. Whisper is for typing only.'
+                : 'KWS wakes Willow. Streaming ASR drives command partials and early fire. Whisper is for typing only.',
             infoGroup
         );
 

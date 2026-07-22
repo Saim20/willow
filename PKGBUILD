@@ -17,6 +17,7 @@ makedepends=(
     'cargo'
     'glib2'
     'bzip2'
+    'cmake'
 )
 optdepends=(
     'cuda: build/run with GPU-accelerated sherpa-onnx'
@@ -89,9 +90,17 @@ package() {
         cp -a "$libdir"/. "$pkgdir/usr/lib/willow/"
         install -Dm644 /dev/null "$pkgdir/usr/share/willow/cuda-enabled"
         install -d "$pkgdir/usr/lib/systemd/user/willow.service.d"
-        cat >"$pkgdir/usr/lib/systemd/user/willow.service.d/cuda.conf" <<'EOF'
+        local toolkit_lib=""
+        for d in /opt/cuda/targets/x86_64-linux/lib /opt/cuda/lib64 /usr/local/cuda/lib64; do
+            if [[ -e "${d}/libcublasLt.so" || -e "${d}/libcublasLt.so.13" || -e "${d}/libcublasLt.so.12" ]]; then
+                toolkit_lib="$d"
+                break
+            fi
+        done
+        cat >"$pkgdir/usr/lib/systemd/user/willow.service.d/cuda.conf" <<EOF
 [Service]
-Environment=LD_LIBRARY_PATH=/usr/lib/willow
+Environment=SHERPA_ONNX_LIB_DIR=/usr/lib/willow
+Environment=LD_LIBRARY_PATH=/usr/lib/willow${toolkit_lib:+:${toolkit_lib}}
 EOF
     fi
 

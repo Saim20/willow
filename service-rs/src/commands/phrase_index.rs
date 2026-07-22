@@ -76,6 +76,18 @@ impl CommandPhraseIndex {
         }
         result
     }
+
+    /// True when `text` is a proper prefix of a registered phrase (mid-word OK).
+    /// Prevents SmartOpen from stealing `"open termin"` before `"open terminal"`.
+    pub fn is_prefix_of_registered_phrase(&self, text: &str) -> bool {
+        let norm = normalize(text);
+        if norm.is_empty() {
+            return false;
+        }
+        self.entries.iter().any(|e| {
+            e.phrase.len() > norm.len() && e.phrase.starts_with(&norm)
+        })
+    }
 }
 
 impl Default for CommandPhraseIndex {

@@ -125,6 +125,11 @@ impl VadEngine {
         };
 
         vad.accept_waveform(chunk);
+        Self::drain_segments(vad, &mut segments);
+        segments
+    }
+
+    fn drain_segments(vad: &VoiceActivityDetector, segments: &mut Vec<Vec<f32>>) {
         while !vad.is_empty() {
             if let Some(seg) = vad.front() {
                 let samples = seg.samples().to_vec();
@@ -138,6 +143,5 @@ impl VadEngine {
                 break;
             }
         }
-        segments
     }
 }

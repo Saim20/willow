@@ -10,6 +10,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import {ConfigManager} from './lib/ConfigManager.js';
 import {createVoiceAssistantProxy} from './lib/DbusInterface.js';
+import {ListeningOverlay} from './lib/ListeningOverlay.js';
 
 const VoiceAssistantIndicator = GObject.registerClass(
 class VoiceAssistantIndicator extends PanelMenu.Button {
@@ -27,19 +28,13 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         });
         this._box.add_child(this._icon);
         
-        this._bufferLabel = new St.Label({
-            text: '',
-            style_class: 'willow-buffer-text',
-            y_align: 2
-        });
-        this._box.add_child(this._bufferLabel);
-        
         this._currentMode = 'normal';
         this._currentBuffer = '';
         this._isRunning = false;
         this._modelsLoaded = false;
         this._bufferIsPartial = false;
         this._speakerEnrolled = false;
+        this._workflowPrompt = '';
         this._enrollmentState = 'idle';
         this._enrollmentSamples = 0;
         this._enrollmentBufferFraction = 0;
@@ -56,6 +51,7 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         
         this._settings = settings;
         this._configManager = new ConfigManager(this._settings);
+        this._listeningOverlay = new ListeningOverlay();
         
         this._setupDBus();
         this._setupMenu();
@@ -141,8 +137,9 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
             this._onError(message, details);
         });
         
-        this._proxy.connectSignal('Notification', (proxy, sender, [title, message, urgency]) => {
-            this._onNotification(title, message, urgency);
+        // Notification signal kept for D-Bus compat; prompts go to HUD only (no banners).
+        this._proxy.connectSignal('Notification', (proxy, sender, [title, message, _urgency]) => {
+            this._onNotification(title, message);
         });
 
         this._proxy.connectSignal('ConfigChanged', (proxy, sender, [configJson]) => {
@@ -262,7 +259,13 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
             'command-threshold',
             'gpu-acceleration',
             'command-endpoint-silence',
-            'incomplete-phrase-wait',
+            'workflow-session-timeout',
+            'early-fire',
+            'llm-enabled',
+            'llm-model-path',
+            'llm-max-tokens',
+            'llm-timeout-ms',
+            'typing-auto-revert',
         ];
         
         syncableKeys.forEach(key => {
@@ -289,12 +292,38 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
                 'command_mode.endpoint_silence',
                 new GLib.Variant('d', endpoint)
             );
-            // Keep legacy key in sync for older tooling.
-            this._settings.set_double('processing-interval', endpoint);
-            const incomplete = this._settings.get_double('incomplete-phrase-wait');
             this._proxy.SetConfigValueRemote(
-                'command_mode.incomplete_hold',
-                new GLib.Variant('d', incomplete)
+                'workflows.session_timeout',
+                new GLib.Variant('d', this._settings.get_double('workflow-session-timeout'))
+            );
+            this._proxy.SetConfigValueRemote(
+                'intent.early_fire',
+                new GLib.Variant('b', this._settings.get_boolean('early-fire'))
+            );
+            const llmEnabled = this._settings.get_boolean('llm-enabled');
+            this._proxy.SetConfigValueRemote(
+                'intent.llm_fallback',
+                new GLib.Variant('b', llmEnabled)
+            );
+            this._proxy.SetConfigValueRemote(
+                'inference.llm.enabled',
+                new GLib.Variant('b', llmEnabled)
+            );
+            this._proxy.SetConfigValueRemote(
+                'inference.llm.model_path',
+                new GLib.Variant('s', this._settings.get_string('llm-model-path'))
+            );
+            this._proxy.SetConfigValueRemote(
+                'inference.llm.max_tokens',
+                new GLib.Variant('i', this._settings.get_int('llm-max-tokens'))
+            );
+            this._proxy.SetConfigValueRemote(
+                'inference.llm.timeout_ms',
+                new GLib.Variant('i', this._settings.get_int('llm-timeout-ms'))
+            );
+            this._proxy.SetConfigValueRemote(
+                'typing_mode.auto_revert',
+                new GLib.Variant('b', this._settings.get_boolean('typing-auto-revert'))
             );
             console.log('Willow: Settings synced to service');
         } catch (e) {
@@ -421,6 +450,9 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     
     _onModeChanged(newMode, oldMode) {
         this._currentMode = newMode;
+        if (newMode !== 'command') {
+            this._workflowPrompt = '';
+        }
         this._updateDisplay();
         console.log(`Willow: Mode changed from ${oldMode} to ${newMode}`);
     }
@@ -434,6 +466,9 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     _onCommandPending(phrase, blocked) {
         if (blocked) {
             this._currentBuffer = `${phrase} (waiting…)`;
+            if (phrase && !this._workflowPrompt) {
+                this._workflowPrompt = phrase;
+            }
         } else if (phrase) {
             this._currentBuffer = phrase;
         }
@@ -447,6 +482,7 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     
     _onCommandExecuted(command, phrase, confidence) {
         this._lastCommandPhrase = phrase || command;
+        this._workflowPrompt = '';
         console.log(`Willow: Command executed: ${phrase} (${(confidence * 100).toFixed(1)}%)`);
         this._updateDisplay();
     }
@@ -493,6 +529,9 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         if (status.current_buffer !== undefined) {
             this._currentBuffer = status.current_buffer.unpack();
         }
+        if (status.workflow_prompt !== undefined) {
+            this._workflowPrompt = status.workflow_prompt.unpack();
+        }
 
         this._maybeAutoStart();
         this._updateDisplay();
@@ -520,12 +559,10 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
     
     _onError(message, details) {
         console.error('Willow:', message, details);
-        Main.notify('Willow', `${message}: ${details}`);
     }
     
-    _onNotification(title, message, urgency) {
-        console.log(`Willow notification: ${title} - ${message}`);
-        Main.notify(title, message);
+    _onNotification(_title, _message) {
+        // Notifications removed — prompts/transcripts go to the HUD only.
     }
     
     _updateDisplay() {
@@ -549,18 +586,6 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         this._icon.icon_name = iconName;
         this._icon.style_class = `system-status-icon ${modeClass}`;
         
-        const maxBufferLength = this._currentMode === 'typing' ? 120 : 50;
-        let bufferText = this._currentBuffer;
-        if (bufferText.length > maxBufferLength) {
-            bufferText = '...' + bufferText.substring(bufferText.length - maxBufferLength);
-        }
-        this._bufferLabel.text = bufferText ? ` ${bufferText}` : '';
-        if (this._bufferLabel) {
-            this._bufferLabel.style_class = this._bufferIsPartial
-                ? 'willow-buffer-text willow-buffer-partial'
-                : 'willow-buffer-text';
-        }
-        
         if (this._smartInfoItem) {
             this._smartInfoItem.visible = (this._currentMode === 'command');
         }
@@ -571,8 +596,8 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
         
         if (this._bufferItem) {
             this._bufferItem.label.text = this._currentBuffer 
-                ? `Buffer: ${this._currentBuffer}` 
-                : 'Buffer: (empty)';
+                ? `Heard: ${this._currentBuffer}` 
+                : 'Heard: (empty)';
         }
 
         if (this._lastCommandItem) {
@@ -622,9 +647,35 @@ class VoiceAssistantIndicator extends PanelMenu.Button {
             this._enrollItem.setSensitive(this._modelsLoaded &&
                 this._enrollmentState !== 'recording');
         }
+
+        this._syncListeningOverlay();
+    }
+
+    _syncListeningOverlay() {
+        if (!this._listeningOverlay) {
+            return;
+        }
+        // Show for whole Command session (HUD replaces the old panel buffer text).
+        if (this._currentMode === 'command') {
+            try {
+                this._listeningOverlay.show();
+                this._listeningOverlay.setContent({
+                    prompt: this._workflowPrompt || '',
+                    transcript: this._currentBuffer || 'Listening…',
+                });
+            } catch (e) {
+                console.error('Willow: ListeningOverlay error:', e);
+            }
+        } else {
+            this._listeningOverlay.hide();
+        }
     }
     
     destroy() {
+        if (this._listeningOverlay) {
+            this._listeningOverlay.destroy();
+            this._listeningOverlay = null;
+        }
         if (this._statusTimer) {
             GLib.source_remove(this._statusTimer);
             this._statusTimer = null;

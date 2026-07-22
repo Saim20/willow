@@ -17,6 +17,10 @@ pub struct WillowConfig {
     pub typing_mode: TypingModeConfig,
     #[serde(default)]
     pub inference: InferenceConfig,
+    #[serde(default)]
+    pub intent: IntentConfig,
+    #[serde(default)]
+    pub workflows: WorkflowConfig,
     pub commands: Vec<Command>,
 }
 
@@ -34,44 +38,105 @@ pub struct KwsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
-    pub endpoint_silence_command: f32,
+    #[serde(default = "default_typing_endpoint")]
     pub endpoint_silence_typing: f32,
+    /// Streaming ASR endpoint rule1 (trailing silence, longer utterances).
+    #[serde(default = "default_stream_rule1")]
+    pub rule1_min_trailing_silence: f32,
+    /// Streaming ASR endpoint rule2 (shorter utterances) — primary for commands.
+    #[serde(default = "default_stream_rule2")]
+    pub rule2_min_trailing_silence: f32,
+}
+
+fn default_typing_endpoint() -> f32 {
+    0.45
+}
+fn default_stream_rule1() -> f32 {
+    2.4
+}
+fn default_stream_rule2() -> f32 {
+    0.6
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            endpoint_silence_typing: default_typing_endpoint(),
+            rule1_min_trailing_silence: default_stream_rule1(),
+            rule2_min_trailing_silence: default_stream_rule2(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentConfig {
+    #[serde(default = "default_true")]
+    pub early_fire: bool,
+    #[serde(default)]
+    pub llm_fallback: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for IntentConfig {
+    fn default() -> Self {
+        Self {
+            early_fire: true,
+            llm_fallback: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowConfig {
+    #[serde(default = "default_workflow_timeout")]
+    pub session_timeout: f32,
+}
+
+fn default_workflow_timeout() -> f32 {
+    12.0
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            session_timeout: default_workflow_timeout(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandModeConfig {
-    /// Silence (seconds) after speech before the utterance is closed and executed.
+    /// Silence knob mirrored into streaming_asr.rule2_min_trailing_silence for Command.
     #[serde(default = "default_endpoint_silence")]
     pub endpoint_silence: f32,
-    /// How long to wait for the rest of a bare prefix like "open …".
-    #[serde(default = "default_incomplete_hold")]
-    pub incomplete_hold: f32,
-    /// Return to Normal after this many idle seconds in Command/Typing.
+    /// Return to Normal after this many idle seconds in Command mode.
     #[serde(default = "default_session_idle")]
     pub session_idle: f32,
-    /// Minimum speech length for Silero VAD (lower = catch short leading words).
+    /// Minimum speech length for Silero VAD (typing).
     #[serde(default = "default_min_speech_duration")]
     pub min_speech_duration: f32,
-    /// Silero speech probability threshold (lower = more sensitive onset).
+    /// Silero speech probability threshold (typing).
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
-    /// Seconds of silence prepended before Whisper (helps first-word accuracy).
+    /// Seconds of silence prepended before Whisper (typing).
     #[serde(default = "default_whisper_pre_pad")]
     pub whisper_pre_pad: f32,
-    /// Extra audio from before VAD onset, prepended to each segment.
+    /// Extra audio from before VAD onset, prepended to each segment (typing).
     #[serde(default = "default_preroll")]
     pub preroll: f32,
 }
 
 fn default_endpoint_silence() -> f32 {
-    // Long enough that natural pauses between words don't split "open firefox".
-    0.5
-}
-fn default_incomplete_hold() -> f32 {
-    1.5
+    0.30
 }
 fn default_session_idle() -> f32 {
     12.0
+}
+fn default_typing_auto_revert() -> bool {
+    false
 }
 fn default_min_speech_duration() -> f32 {
     0.1
@@ -90,7 +155,6 @@ impl Default for CommandModeConfig {
     fn default() -> Self {
         Self {
             endpoint_silence: default_endpoint_silence(),
-            incomplete_hold: default_incomplete_hold(),
             session_idle: default_session_idle(),
             min_speech_duration: default_min_speech_duration(),
             vad_threshold: default_vad_threshold(),
@@ -108,6 +172,39 @@ pub struct InferenceConfig {
     /// `0` = auto (up to 4 threads).
     #[serde(default)]
     pub num_threads: i32,
+    /// Optional local LLM fallback (llama-cli + GGUF).
+    #[serde(default)]
+    pub llm: LlmConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model_path: String,
+    #[serde(default = "default_llm_tokens")]
+    pub max_tokens: i32,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_ms: i32,
+}
+
+fn default_llm_tokens() -> i32 {
+    64
+}
+fn default_llm_timeout() -> i32 {
+    400
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: String::new(),
+            max_tokens: default_llm_tokens(),
+            timeout_ms: default_llm_timeout(),
+        }
+    }
 }
 
 fn default_provider() -> String {
@@ -119,6 +216,7 @@ impl Default for InferenceConfig {
         Self {
             provider: default_provider(),
             num_threads: 0,
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -127,8 +225,27 @@ impl Default for InferenceConfig {
 pub struct TypingModeConfig {
     pub realtime: bool,
     pub max_backspace: i32,
-    pub check_recent_chars: i32,
     pub exit_phrases: Vec<String>,
+    /// When true, return to Normal after `command_mode.session_idle` with no speech.
+    /// Default false — typing stays active until an exit phrase or manual mode change.
+    #[serde(default = "default_typing_auto_revert")]
+    pub auto_revert: bool,
+}
+
+impl Default for TypingModeConfig {
+    fn default() -> Self {
+        Self {
+            realtime: false,
+            max_backspace: 80,
+            exit_phrases: vec![
+                "stop typing".into(),
+                "exit typing".into(),
+                "normal mode".into(),
+                "go to normal mode".into(),
+            ],
+            auto_revert: default_typing_auto_revert(),
+        }
+    }
 }
 
 impl Default for WillowConfig {
@@ -142,23 +259,12 @@ impl Default for WillowConfig {
                 enrolled_user: "owner".into(),
             },
             kws: KwsConfig { threshold: 0.25 },
-            streaming_asr: StreamingConfig {
-                endpoint_silence_command: default_endpoint_silence(),
-                endpoint_silence_typing: 0.45,
-            },
+            streaming_asr: StreamingConfig::default(),
             command_mode: CommandModeConfig::default(),
-            typing_mode: TypingModeConfig {
-                realtime: false,
-                max_backspace: 80,
-                check_recent_chars: 100,
-                exit_phrases: vec![
-                    "stop typing".into(),
-                    "exit typing".into(),
-                    "normal mode".into(),
-                    "go to normal mode".into(),
-                ],
-            },
+            typing_mode: TypingModeConfig::default(),
             inference: InferenceConfig::default(),
+            intent: IntentConfig::default(),
+            workflows: WorkflowConfig::default(),
             commands: default_commands(),
         }
     }

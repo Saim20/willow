@@ -50,13 +50,13 @@ OVERRIDE_ENV="Environment=WILLOW_SOURCE_ROOT=$ROOT
 Environment=PATH=$BIN_DIR:/usr/bin:/usr/local/bin
 TimeoutStopSec=15"
 if [[ -n "${WILLOW_CUDA_LIB_DIR:-}" ]]; then
+    LD_PATH="${WILLOW_CUDA_LIB_DIR}"
+    if [[ -n "${WILLOW_CUDA_TOOLKIT_LIB_DIR:-}" ]]; then
+        LD_PATH="${LD_PATH}:${WILLOW_CUDA_TOOLKIT_LIB_DIR}"
+    fi
     OVERRIDE_ENV="${OVERRIDE_ENV}
 Environment=SHERPA_ONNX_LIB_DIR=${WILLOW_CUDA_LIB_DIR}
-Environment=LD_LIBRARY_PATH=${WILLOW_CUDA_LIB_DIR}"
-    if [[ -n "${WILLOW_CUDA12_COMPAT_LIB_DIR:-}" ]]; then
-        OVERRIDE_ENV="${OVERRIDE_ENV}
-Environment=LD_LIBRARY_PATH=${WILLOW_CUDA12_COMPAT_LIB_DIR}:${WILLOW_CUDA_LIB_DIR}"
-    fi
+Environment=LD_LIBRARY_PATH=${LD_PATH}"
 fi
 cat >"$OVERRIDE_DIR/override.conf" <<EOF
 [Service]

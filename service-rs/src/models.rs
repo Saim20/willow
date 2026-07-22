@@ -40,6 +40,22 @@ impl ModelPaths {
         self.find_transducer_in_dir(&dir)
     }
 
+    /// Streaming zipformer transducer for command-mode ASR.
+    pub fn find_streaming_asr_model(&self) -> Option<TransducerModelFiles> {
+        for name in [
+            "asr-stream",
+            "streaming-asr",
+            "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17",
+            "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        ] {
+            let dir = self.base_path.join(name);
+            if let Some(files) = self.find_transducer_in_dir(&dir) {
+                return Some(files);
+            }
+        }
+        None
+    }
+
     pub fn find_vad_model(&self) -> Option<String> {
         for name in ["vad", "silero-vad", "silero_vad"] {
             let dir = self.base_path.join(name);
@@ -162,16 +178,26 @@ impl ModelPaths {
             if !path.is_file() {
                 continue;
             }
-            let name = path.file_name()?.to_string_lossy().to_string();
+            let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
             if !name.ends_with(".onnx") {
                 continue;
             }
+            // Prefer int8 variants when both float and int8 exist.
             if name.contains("encoder") {
-                encoder = Some(path);
+                let take = encoder.is_none() || name.contains("int8");
+                if take {
+                    encoder = Some(path);
+                }
             } else if name.contains("decoder") {
-                decoder = Some(path);
+                let take = decoder.is_none() || name.contains("int8");
+                if take {
+                    decoder = Some(path);
+                }
             } else if name.contains("joiner") {
-                joiner = Some(path);
+                let take = joiner.is_none() || name.contains("int8");
+                if take {
+                    joiner = Some(path);
+                }
             }
         }
 
@@ -297,6 +323,31 @@ mod tests {
         assert!(found.decoder.contains("decoder.int8"));
 
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&model_root);
+    }
+
+    #[test]
+    fn finds_streaming_asr_layout() {
+        let model_root = std::env::temp_dir().join(format!(
+            "willow-stream-models-{}",
+            std::process::id()
+        ));
+        let stream = model_root.join("asr-stream");
+        let _ = fs::remove_dir_all(&model_root);
+        fs::create_dir_all(&stream).unwrap();
+        fs::write(stream.join("tokens.txt"), "a\n").unwrap();
+        fs::write(stream.join("encoder-epoch-99-avg-1.int8.onnx"), b"enc").unwrap();
+        fs::write(stream.join("decoder-epoch-99-avg-1.int8.onnx"), b"dec").unwrap();
+        fs::write(stream.join("joiner-epoch-99-avg-1.int8.onnx"), b"join").unwrap();
+
+        let found = ModelPaths::new(&model_root)
+            .find_streaming_asr_model()
+            .expect("should find asr-stream transducer");
+        assert!(found.encoder.contains("encoder"));
+        assert!(found.decoder.contains("decoder"));
+        assert!(found.joiner.contains("joiner"));
+        assert!(found.tokens.ends_with("tokens.txt"));
+
         let _ = fs::remove_dir_all(&model_root);
     }
 }

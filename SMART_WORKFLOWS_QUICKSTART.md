@@ -1,149 +1,54 @@
-# Quick Start Guide - Smart Workflows
+# Quick Start — Smart Workflows
 
-## Installation
-
-After building and installing Willow, copy the context configuration:
+## Setup
 
 ```bash
+# From the willow repo
+./deploy-dev.sh
+
+# Ensure context aliases exist
 mkdir -p ~/.config/willow
-cp /path/to/willow/context.json ~/.config/willow/context.json
+cp context.json ~/.config/willow/context.json
 ```
 
-Then rebuild and install the service:
+Models (KWS, streaming ASR, Whisper, VAD) install under `~/.local/share/willow/models/` via deploy or `willow-download-model`.
 
-```bash
-cd service/build
-cmake .. && make -j$(nproc)
-sudo make install
-systemctl --user restart willow.service
-```
+## Usage
 
-## Usage Examples
+Say the hotword (**hey willow**), then:
 
-### Opening Applications
-
-Just say "**open**" or "**launch**" followed by the app name:
+### Opening applications
 
 | Say this | What happens |
 |----------|--------------|
 | "open spotify" | Launches Spotify if installed |
-| "launch firefox" | Opens Firefox browser |
-| "start terminal" | Opens your default terminal (kgx) |
-| "open files" | Opens file manager (nautilus) |
-| "launch discord" | Opens Discord |
-| "open vscode" | Opens VS Code (tries code, code-oss, vscodium) |
+| "open firefox" | Opens Firefox |
+| "open terminal" | Opens your default terminal (kgx) — exact phrases early-fire |
+| "open" then "firefox" | Multi-turn slot fill via the floating HUD |
 
-### Web Searches
+Mid-word ASR fragments like `"open termin"` are held until the registered phrase completes.
 
-Say "**search [engine] for [your query]**":
+### Web searches
 
 | Say this | What happens |
 |----------|--------------|
-| "search youtube for cooking recipes" | Opens YouTube with search results |
-| "search google for weather today" | Opens Google search |
-| "search github for python projects" | Opens GitHub search |
-| "search reddit for gaming news" | Opens Reddit search |
-| "search wikipedia for albert einstein" | Opens Wikipedia search |
+| "search youtube for cooking recipes" | YouTube results |
+| "search google for weather today" | Google search |
+| "search github for python projects" | GitHub search |
 
-### Supported Search Engines
+### Cancel
 
-- `youtube` - YouTube video search
-- `google` - Google web search
-- `facebook` - Facebook search
-- `reddit` - Reddit search
-- `wikipedia` - Wikipedia articles
-- `github` - GitHub repository search
+Say **"cancel"** or **"never mind"** to exit Command mode or clear a pending workflow.
 
-## Customization
+## Customize
 
-Edit `~/.config/willow/context.json` to customize your setup:
+Edit `~/.config/willow/context.json` for app aliases and search engines. Edit `~/.config/willow/config.json` or use **GNOME Extensions → Willow** prefs for:
 
-### Change Default Browser
+- Early command fire
+- Streaming silence / workflow session timeout
+- Optional local LLM fallback (GGUF path, tokens, timeout)
+- Typing auto-revert
 
-```json
-{
-  "default_apps": {
-    "browser": "brave-browser"  // or "chromium", "google-chrome", etc.
-  }
-}
-```
+## Optional LLM
 
-### Add Custom Search Engines
-
-```json
-{
-  "search_engines": {
-    "ddg": "https://duckduckgo.com/?q=",
-    "amazon": "https://www.amazon.com/s?k="
-  }
-}
-```
-
-Then use: "search ddg for privacy tools" or "search amazon for laptop"
-
-### Add App Aliases
-
-If an app has multiple command names:
-
-```json
-{
-  "app_aliases": {
-    "music": ["rhythmbox", "spotify", "vlc"],
-    "editor": ["code", "gedit", "vim"]
-  }
-}
-```
-
-Then: "open music" will try rhythmbox, then spotify, then vlc.
-
-## Tips
-
-1. **Natural Language**: Speak naturally - "open spotify" works just as well as "launch spotify"
-2. **Case Insensitive**: App names are case-insensitive ("Open Spotify" = "open spotify")
-3. **App Discovery**: The assistant checks if apps exist before trying to launch them
-4. **No Pre-configuration**: Unlike static commands, smart workflows work dynamically
-
-## Troubleshooting
-
-**App doesn't open?**
-- Check if it's installed: `which spotify`
-- Add it to app_aliases in context.json
-- Check logs: `journalctl --user -u willow.service -f`
-
-**Search doesn't work?**
-- Verify default browser is set correctly in context.json
-- Check if browser is installed: `which firefox`
-- Ensure ydotool service is running: `systemctl --user status ydotool`
-
-**Context not loading?**
-- Verify file exists: `cat ~/.config/willow/context.json`
-- Check JSON syntax: `jq . ~/.config/willow/context.json`
-- Restart service: `systemctl --user restart willow.service`
-
-## Complete Workflow Example
-
-```
-1. Activate: "hey"
-   → Assistant enters command mode (red pulsing icon)
-
-2. Open app: "open spotify"
-   → Spotify launches
-
-3. Search: "search youtube for jazz music"
-   → Firefox opens with YouTube search results
-
-4. Return: "normal mode"
-   → Assistant returns to normal mode (microphone icon)
-```
-
-## Integration with Static Commands
-
-Smart workflows are checked FIRST, then fall back to static commands from `config.json`:
-
-1. User speaks
-2. Check for "open/launch" pattern → Execute if matched
-3. Check for "search X for Y" pattern → Execute if matched  
-4. Check static commands from config.json → Execute if confidence met
-5. No match → Log and ignore
-
-This means you can still use all your existing commands while benefiting from smart workflows!
+Requires `llama-cli` on `PATH` and a GGUF at the configured path. Off by default; only runs after endpoint when deterministic matching fails.

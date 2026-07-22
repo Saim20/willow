@@ -49,6 +49,7 @@ impl Agc {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn current_gain(&self) -> f32 {
         self.gain
     }

@@ -13,13 +13,22 @@
   },
 
   "streaming_asr": {
-    "endpoint_silence_command": 0.5,
-    "endpoint_silence_typing": 0.45
+    "endpoint_silence_typing": 0.45,
+    "rule1_min_trailing_silence": 2.4,
+    "rule2_min_trailing_silence": 0.6
+  },
+
+  "intent": {
+    "early_fire": true,
+    "llm_fallback": false
+  },
+
+  "workflows": {
+    "session_timeout": 12.0
   },
 
   "command_mode": {
-    "endpoint_silence": 0.5,
-    "incomplete_hold": 1.5,
+    "endpoint_silence": 0.30,
     "session_idle": 12.0,
     "min_speech_duration": 0.1,
     "vad_threshold": 0.45,
@@ -29,7 +38,13 @@
 
   "inference": {
     "provider": "auto",
-    "num_threads": 0
+    "num_threads": 0,
+    "llm": {
+      "enabled": false,
+      "model_path": "",
+      "max_tokens": 64,
+      "timeout_ms": 400
+    }
   },
 
   "commands": [
@@ -78,7 +93,7 @@
   "typing_mode": {
     "realtime": false,
     "max_backspace": 80,
-    "check_recent_chars": 100,
+    "auto_revert": false,
     "exit_phrases": [
       "stop typing",
       "exit typing",

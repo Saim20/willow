@@ -58,6 +58,7 @@ need glib-compile-schemas "glib2"
 need curl "curl (or wget)"
 need tar "tar"
 need systemctl "systemd"
+need cmake "cmake (required for CUDA 13+ sherpa builds)"
 
 export WILLOW_SOURCE_ROOT="$ROOT"
 
@@ -87,13 +88,8 @@ willow_cargo_build "$ROOT/service-rs/Cargo.toml" "$BUILD_MODE"
 
 # Persist LD_LIBRARY_PATH for CUDA builds in user systemd override
 CUDA_LIB_DIR=""
-COMPAT_LIB_DIR=""
 if [[ "$BUILD_MODE" == "cuda" && -n "${SHERPA_ONNX_LIB_DIR:-}" ]]; then
     CUDA_LIB_DIR="$SHERPA_ONNX_LIB_DIR"
-    COMPAT_LIB_DIR="${WILLOW_CUDA12_COMPAT_LIB_DIR:-$(willow_default_cuda12_compat_lib_dir)}"
-    if [[ ! -f "${COMPAT_LIB_DIR}/libcublasLt.so.12" ]]; then
-        COMPAT_LIB_DIR="$(willow_setup_cuda12_compat 2>/dev/null || true)"
-    fi
     mkdir -p "$HOME/.config/willow"
     RUNTIME_PATH="$(willow_cuda_runtime_lib_path)"
     cat >"$HOME/.config/willow/sherpa-cuda.env" <<EOF
@@ -127,9 +123,14 @@ if [[ "$SYSTEM_INSTALL" -eq 1 || "${WILLOW_INSTALL_SYSTEM:-0}" == "1" ]]; then
         sudo mkdir -p /usr/lib/willow
         sudo cp -a "$CUDA_LIB_DIR"/. /usr/lib/willow/
         sudo mkdir -p /usr/lib/systemd/user/willow.service.d
+        CUDA_TOOLKIT_LIB=""
+        if CUDA_TOOLKIT_LIB="$(willow_cuda_toolkit_lib_dir 2>/dev/null)"; then
+            :
+        fi
         sudo tee /usr/lib/systemd/user/willow.service.d/cuda.conf >/dev/null <<EOF
 [Service]
-Environment=LD_LIBRARY_PATH=/usr/lib/willow
+Environment=LD_LIBRARY_PATH=/usr/lib/willow${CUDA_TOOLKIT_LIB:+:${CUDA_TOOLKIT_LIB}}
+Environment=SHERPA_ONNX_LIB_DIR=/usr/lib/willow
 EOF
         sudo touch /usr/share/willow/cuda-enabled
     fi
@@ -139,12 +140,8 @@ else
     # Pass CUDA lib path into the user unit override
     if [[ -n "$CUDA_LIB_DIR" ]]; then
         export WILLOW_CUDA_LIB_DIR="$CUDA_LIB_DIR"
-        if [[ -n "${COMPAT_LIB_DIR:-}" ]]; then
-            export WILLOW_CUDA12_COMPAT_LIB_DIR="$COMPAT_LIB_DIR"
-        elif [[ -n "${WILLOW_CUDA12_COMPAT_LIB_DIR:-}" ]]; then
-            :
-        else
-            export WILLOW_CUDA12_COMPAT_LIB_DIR="$(willow_default_cuda12_compat_lib_dir)"
+        if toolkit="$(willow_cuda_toolkit_lib_dir 2>/dev/null)"; then
+            export WILLOW_CUDA_TOOLKIT_LIB_DIR="$toolkit"
         fi
     fi
     bash "$ROOT/scripts/install-service-dev.sh"

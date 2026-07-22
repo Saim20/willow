@@ -198,6 +198,37 @@
     color: white;
 }
 
+.willow-listening-card {
+    background-color: rgba(20, 22, 28, 0.92);
+    border-radius: 28px;
+    padding: 28px 40px;
+    min-width: 280px;
+    max-width: 520px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.willow-listening-title {
+    font-size: 28px;
+    font-weight: 700;
+    color: #f4f4f5;
+    letter-spacing: 0.02em;
+}
+
+.willow-listening-prompt {
+    font-size: 15px;
+    color: #a1a1aa;
+    margin-top: 8px;
+    text-align: center;
+}
+
+.willow-listening-transcript {
+    font-size: 18px;
+    color: #fafafa;
+    margin-top: 14px;
+    text-align: center;
+    font-style: italic;
+}
+
 .key-builder-button.accent:checked {
     background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
 }

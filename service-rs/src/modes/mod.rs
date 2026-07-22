@@ -3,40 +3,46 @@ use std::time::{Duration, Instant};
 use crate::commands::phrase_index::normalize;
 use crate::commands::CommandWorker;
 use crate::config::WillowConfig;
+use crate::intent::{IntentAction, IntentEngine};
+use crate::llm::LlmFallback;
 use crate::pipeline::SpeechPipeline;
-use crate::types::{CommandDispatchResult, Mode, TranscriptionResult};
+use crate::types::{Mode, TranscriptionResult};
+use crate::workflows::{WorkflowEvent, WorkflowRuntime};
 
-/// How long to wait for the rest of an incomplete command like "open …".
-const DEFAULT_INCOMPLETE_HOLD: Duration = Duration::from_millis(1500);
-/// Return to Normal after this much silence with no speech/commands.
 const DEFAULT_SESSION_IDLE: Duration = Duration::from_secs(12);
 
 pub struct ModeStateMachine {
     mode: Mode,
     buffer: String,
-    /// Prefix held when ASR endpointed mid-command (e.g. just "open").
-    incomplete_prefix: Option<String>,
-    incomplete_at: Option<Instant>,
     last_activity: Option<Instant>,
     typing_last_typed: String,
     worker: CommandWorker,
+    intent: IntentEngine,
+    workflows: WorkflowRuntime,
+    llm: LlmFallback,
     typing_realtime: bool,
     typing_max_backspace: i32,
     typing_exit_phrases: Vec<String>,
-    incomplete_hold: Duration,
+    typing_auto_revert: bool,
     session_idle: Duration,
+    llm_fallback: bool,
+    /// Prompt to surface on the HUD.
+    last_prompt: Option<String>,
+    /// Phrases kept for LLM prompting (updated via apply_config).
+    known_command_phrases: Vec<String>,
 }
 
 impl ModeStateMachine {
-    pub fn new(worker: CommandWorker) -> Self {
+    pub fn new(worker: CommandWorker, intent: IntentEngine, llm: LlmFallback) -> Self {
         Self {
             mode: Mode::Normal,
             buffer: String::new(),
-            incomplete_prefix: None,
-            incomplete_at: None,
             last_activity: None,
             typing_last_typed: String::new(),
             worker,
+            intent,
+            workflows: WorkflowRuntime::new(),
+            llm,
             typing_realtime: false,
             typing_max_backspace: 80,
             typing_exit_phrases: vec![
@@ -45,8 +51,11 @@ impl ModeStateMachine {
                 "normal mode".into(),
                 "go to normal mode".into(),
             ],
-            incomplete_hold: DEFAULT_INCOMPLETE_HOLD,
+            typing_auto_revert: false,
             session_idle: DEFAULT_SESSION_IDLE,
+            llm_fallback: false,
+            last_prompt: None,
+            known_command_phrases: Vec::new(),
         }
     }
 
@@ -54,15 +63,30 @@ impl ModeStateMachine {
         self.typing_realtime = config.typing_mode.realtime;
         self.typing_max_backspace = config.typing_mode.max_backspace;
         self.typing_exit_phrases = config.typing_mode.exit_phrases.clone();
-        self.incomplete_hold = Duration::from_secs_f32(
-            config.command_mode.incomplete_hold.clamp(0.3, 8.0),
-        );
+        self.typing_auto_revert = config.typing_mode.auto_revert;
         self.session_idle =
             Duration::from_secs_f32(config.command_mode.session_idle.clamp(3.0, 120.0));
+        self.intent
+            .set_threshold(config.command_threshold_fraction());
+        self.intent.set_commands(config.commands.clone());
+        self.intent.set_early_fire(config.intent.early_fire);
+        self.llm_fallback = config.intent.llm_fallback && config.inference.llm.enabled;
+        self.llm.apply_config(config.inference.llm.clone());
+        self.workflows
+            .set_timeout_secs(config.workflows.session_timeout);
+        self.known_command_phrases = config
+            .commands
+            .iter()
+            .flat_map(|c| c.phrases.clone())
+            .collect();
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub fn last_prompt(&self) -> Option<&str> {
+        self.last_prompt.as_deref()
     }
 
     fn touch(&mut self) {
@@ -73,7 +97,8 @@ impl ModeStateMachine {
         self.mode = mode;
         self.buffer.clear();
         self.typing_last_typed.clear();
-        self.clear_incomplete();
+        self.workflows.clear();
+        self.last_prompt = None;
         if matches!(mode, Mode::Command | Mode::Typing) {
             self.touch();
         } else {
@@ -86,9 +111,16 @@ impl ModeStateMachine {
         pipeline.set_mode(mode);
     }
 
-    /// Exit Command/Typing after prolonged inactivity.
     pub fn tick_idle(&mut self, pipeline: &mut SpeechPipeline) -> Option<ModeChange> {
-        if !matches!(self.mode, Mode::Command | Mode::Typing) {
+        if self.workflows.tick_timeout() {
+            self.last_prompt = None;
+        }
+        let should_idle = match self.mode {
+            Mode::Command => true,
+            Mode::Typing => self.typing_auto_revert,
+            Mode::Normal => false,
+        };
+        if !should_idle {
             return None;
         }
         let idle = self
@@ -116,7 +148,12 @@ impl ModeStateMachine {
     ) -> Option<ModeChange> {
         match keyword {
             "command" | "normal" | "typing" => {
-                if matches!(keyword, "command" | "typing") && !pipeline.ready_for_command() {
+                let ready = match keyword {
+                    "command" => pipeline.ready_for_command(),
+                    "typing" => pipeline.ready_for_typing(),
+                    _ => true,
+                };
+                if !ready {
                     return None;
                 }
                 let new_mode = Mode::from_str(keyword);
@@ -139,52 +176,28 @@ impl ModeStateMachine {
         &mut self,
         result: &TranscriptionResult,
         pipeline: &mut SpeechPipeline,
-    ) -> Option<ModeChange> {
+    ) -> TranscriptionOutcome {
         if self.mode == Mode::Normal {
-            return None;
+            return TranscriptionOutcome::default();
         }
 
         self.buffer = result.text.clone();
         self.touch();
 
         match self.mode {
-            Mode::Command => {
-                if result.is_endpoint {
-                    let text = self.merge_with_incomplete(&result.text);
-                    if text.is_empty() {
-                        pipeline.reset_listening();
-                        return None;
-                    }
-                    // Hold bare prefixes before resolving — process_endpoint records history.
-                    if is_incomplete_command(&text) {
-                        self.incomplete_prefix = Some(text);
-                        self.incomplete_at = Some(Instant::now());
-                        pipeline.reset_listening();
-                        return None;
-                    }
-                    let dispatch = pipeline.resolver.process_endpoint(&text);
-                    // Hold 1–2 word scraps that didn't match so the next chunk can merge.
-                    if should_hold_short_fragment(&text, dispatch.handled) {
-                        self.incomplete_prefix = Some(text);
-                        self.incomplete_at = Some(Instant::now());
-                        pipeline.reset_listening();
-                        return None;
-                    }
-                    self.clear_incomplete();
-                    self.dispatch_command(dispatch, pipeline);
-                    pipeline.reset_listening();
-                }
-                None
-            }
+            Mode::Command => self.handle_command_transcript(result, pipeline),
             Mode::Typing => {
                 let text = format_for_typing(&result.text);
                 if self.check_exit_phrases(&text) {
                     let old = self.mode;
                     self.set_mode_with_pipeline(Mode::Normal, pipeline);
-                    return Some(ModeChange {
-                        new_mode: Mode::Normal,
-                        old_mode: old,
-                    });
+                    return TranscriptionOutcome {
+                        mode_change: Some(ModeChange {
+                            new_mode: Mode::Normal,
+                            old_mode: old,
+                        }),
+                        ..Default::default()
+                    };
                 }
                 if result.is_final || result.is_endpoint {
                     self.commit_typing_phrase(&text);
@@ -193,84 +206,165 @@ impl ModeStateMachine {
                 } else if self.typing_realtime {
                     self.apply_typing_delta(&text);
                 }
-                None
+                TranscriptionOutcome::default()
             }
-            Mode::Normal => None,
+            Mode::Normal => TranscriptionOutcome::default(),
         }
     }
 
-    fn merge_with_incomplete(&mut self, text: &str) -> String {
-        let expired = self
-            .incomplete_at
-            .is_some_and(|t| t.elapsed() > self.incomplete_hold);
-        if expired {
-            self.clear_incomplete();
+    fn handle_command_transcript(
+        &mut self,
+        result: &TranscriptionResult,
+        pipeline: &mut SpeechPipeline,
+    ) -> TranscriptionOutcome {
+        // Whisper in Command mode is reserved for search accuracy (VAD-segmented).
+        // Other commands use streaming ASR early-fire / endpoints.
+        if result.from_whisper && !self.is_search_whisper_candidate(&result.text) {
+            return TranscriptionOutcome::default();
         }
-        let norm = normalize(text);
-        match self.incomplete_prefix.take() {
-            Some(prefix) if !norm.is_empty() => {
-                self.incomplete_at = None;
-                if norm.starts_with(&prefix) {
-                    norm
+
+        let mut outcome = TranscriptionOutcome::default();
+        let mut decision =
+            self.intent
+                .on_partial(&result.text, result.is_endpoint, result.from_whisper);
+
+        // Incomplete-phrase session: re-match merged text when we get more words.
+        if let Some(session) = self.workflows.session() {
+            if session.kind == crate::workflows::SessionKind::IncompletePhrase {
+                let merged = if normalize(&result.text).starts_with(&session.prefix) {
+                    normalize(&result.text)
                 } else {
-                    format!("{prefix} {norm}")
+                    format!("{} {}", session.prefix, normalize(&result.text))
+                };
+                let rematch =
+                    self.intent
+                        .on_partial(&merged, result.is_endpoint, result.from_whisper);
+                if rematch.fire || rematch.action.is_some() {
+                    decision = rematch;
                 }
             }
-            Some(prefix) => {
-                self.incomplete_prefix = Some(prefix.clone());
-                prefix
+        }
+
+        // Hold early-fire until the stream marks the hypothesis stable (or endpoint).
+        // Must happen before workflow integrate so sessions aren't cleared on a speculative fire.
+        let can_commit = result.is_endpoint || result.is_stable;
+        if decision.fire && !can_commit {
+            decision.fire = false;
+            if outcome.pending_phrase.is_none() {
+                if let Some(IntentAction::Pending { prompt, .. }) = &decision.action {
+                    outcome.pending_phrase = Some(prompt.clone());
+                } else if !result.text.is_empty() {
+                    outcome.pending_phrase = Some(result.text.clone());
+                }
             }
-            None => norm,
         }
+
+        let (decision, wf_event) =
+            self.workflows
+                .integrate(&result.text, decision, result.from_whisper, can_commit);
+        match wf_event {
+            Some(WorkflowEvent::Prompt(p)) => {
+                self.last_prompt = Some(p.clone());
+                outcome.prompt = Some(p);
+            }
+            Some(WorkflowEvent::Cleared) => {
+                self.last_prompt = None;
+            }
+            None => {}
+        }
+
+        if decision.fire {
+            if let Some(action) = decision.action {
+                if let Some(change) = self.dispatch_intent(action, pipeline) {
+                    outcome.mode_change = Some(change);
+                }
+                pipeline.reset_listening();
+            }
+            return outcome;
+        }
+
+        if decision.needs_llm && result.is_endpoint && self.llm_fallback {
+            let known = self.known_phrases();
+            let llm_decision = self.llm.resolve(&result.text, &known);
+            if llm_decision.fire {
+                if let Some(action) = llm_decision.action {
+                    if let Some(change) = self.dispatch_intent(action, pipeline) {
+                        outcome.mode_change = Some(change);
+                    }
+                    pipeline.reset_listening();
+                }
+            }
+        }
+
+        if !result.is_endpoint {
+            if let Some(IntentAction::Pending { prompt, .. }) = &decision.action {
+                outcome.pending_phrase = Some(prompt.clone());
+            }
+        }
+
+        outcome
     }
 
-    fn clear_incomplete(&mut self) {
-        self.incomplete_prefix = None;
-        self.incomplete_at = None;
+    fn is_search_whisper_candidate(&self, text: &str) -> bool {
+        let norm = normalize(text);
+        if norm.starts_with("search") {
+            return true;
+        }
+        self.workflows
+            .session()
+            .is_some_and(|s| s.kind == crate::workflows::SessionKind::SearchQuery)
     }
 
-    fn dispatch_command(&mut self, result: CommandDispatchResult, pipeline: &mut SpeechPipeline) {
-        if !result.handled {
-            return;
-        }
+    fn known_phrases(&self) -> Vec<String> {
+        self.known_command_phrases.clone()
+    }
 
-        if result.command_action.is_empty() && !result.is_search && !result.is_smart_open {
-            return;
+    fn dispatch_intent(
+        &mut self,
+        action: IntentAction,
+        pipeline: &mut SpeechPipeline,
+    ) -> Option<ModeChange> {
+        match action {
+            IntentAction::ExitCommandMode => {
+                let old = self.mode;
+                self.set_mode_with_pipeline(Mode::Normal, pipeline);
+                Some(ModeChange {
+                    new_mode: Mode::Normal,
+                    old_mode: old,
+                })
+            }
+            IntentAction::StartTypingMode => {
+                let old = self.mode;
+                self.set_mode_with_pipeline(Mode::Typing, pipeline);
+                Some(ModeChange {
+                    new_mode: Mode::Typing,
+                    old_mode: old,
+                })
+            }
+            IntentAction::RunCommand {
+                name,
+                action,
+                phrase,
+                confidence,
+            } => {
+                tracing::info!("Running command '{name}' for phrase {phrase:?}");
+                self.worker.execute(action, phrase, confidence);
+                None
+            }
+            IntentAction::SmartOpen { app, phrase } => {
+                self.worker.smart_open(app, phrase, 1.0);
+                None
+            }
+            IntentAction::SmartSearch {
+                engine,
+                query,
+                phrase,
+            } => {
+                self.worker.smart_search(engine, query, phrase, 1.0);
+                None
+            }
+            IntentAction::Pending { .. } => None,
         }
-
-        if result.is_search {
-            self.worker.smart_search(
-                result.search_engine,
-                result.search_query,
-                result.matched_phrase,
-                result.confidence,
-            );
-            return;
-        }
-
-        if result.is_smart_open {
-            self.worker.smart_open(
-                result.app_name,
-                result.matched_phrase,
-                result.confidence,
-            );
-            return;
-        }
-
-        if result.command_action == "exit_command_mode" {
-            self.set_mode_with_pipeline(Mode::Normal, pipeline);
-            return;
-        }
-        if result.command_action == "start_typing_mode" {
-            self.set_mode_with_pipeline(Mode::Typing, pipeline);
-            return;
-        }
-
-        self.worker.execute(
-            result.command_action,
-            result.matched_phrase,
-            result.confidence,
-        );
     }
 
     fn check_exit_phrases(&self, text: &str) -> bool {
@@ -314,28 +408,6 @@ impl ModeStateMachine {
 
 fn format_for_typing(text: &str) -> String {
     normalize(text)
-}
-
-fn is_incomplete_command(text: &str) -> bool {
-    let norm = normalize(text);
-    if norm.is_empty() {
-        return false;
-    }
-    matches!(norm.as_str(), "open" | "launch" | "start" | "search")
-        || norm.ends_with(" for")
-        || ["open", "launch", "start", "search"]
-            .iter()
-            .any(|t| norm == format!("{t} the") || norm == format!("{t} a"))
-}
-
-/// Hold 1–2 word scraps that didn't match a command so the next VAD chunk can merge.
-fn should_hold_short_fragment(text: &str, handled: bool) -> bool {
-    if handled {
-        return false;
-    }
-    let norm = normalize(text);
-    let words = norm.split_whitespace().count();
-    matches!(words, 1 | 2)
 }
 
 fn typing_word_delta(old: &str, new: &str, max_backspace: i32) -> (usize, String) {
@@ -400,6 +472,13 @@ pub struct ModeChange {
     pub old_mode: Mode,
 }
 
+#[derive(Debug, Default)]
+pub struct TranscriptionOutcome {
+    pub mode_change: Option<ModeChange>,
+    pub prompt: Option<String>,
+    pub pending_phrase: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,25 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn word_delta_revises_middle_word() {
-        let (del, typed) = typing_word_delta("the quick brown", "the fast brown", 80);
-        assert_eq!(del, 12);
-        assert_eq!(typed, " fast brown");
-    }
-
-    #[test]
     fn commit_suffix_after_partial() {
         assert_eq!(typing_suffix_after("hello wor", "hello world"), "ld");
-    }
-
-    #[test]
-    fn incomplete_open_detected() {
-        assert!(is_incomplete_command("open"));
-        assert!(is_incomplete_command("Open"));
-        assert!(is_incomplete_command("launch"));
-        assert!(is_incomplete_command("search google for"));
-        assert!(!is_incomplete_command("open firefox"));
-        assert!(!is_incomplete_command("start typing"));
-        assert!(!is_incomplete_command("exit"));
     }
 }

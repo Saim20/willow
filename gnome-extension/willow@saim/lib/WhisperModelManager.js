@@ -26,16 +26,23 @@ export class WhisperModelManager {
                 check: () => this._hasOnnxFiles(`${this._modelDir}/kws`),
             },
             {
+                id: 'asr-stream',
+                name: 'Streaming ASR',
+                description: 'Command-mode partial transcripts and early fire',
+                size: '~120 MB',
+                check: () => this._hasTransducerFiles(`${this._modelDir}/asr-stream`),
+            },
+            {
                 id: 'whisper',
                 name: 'Whisper ASR',
-                description: 'Command and typing recognition (VAD-segmented)',
+                description: 'Typing / dictation recognition (VAD-segmented)',
                 size: '~75 MB',
                 check: () => this._hasWhisperFiles(`${this._modelDir}/whisper`),
             },
             {
                 id: 'vad',
                 name: 'Silero VAD',
-                description: 'Speech endpointing for Whisper',
+                description: 'Speech endpointing for typing Whisper',
                 size: '~1 MB',
                 check: () => Gio.File.new_for_path(`${this._modelDir}/vad/silero_vad.onnx`).query_exists(null),
             },
@@ -53,7 +60,7 @@ export class WhisperModelManager {
     createModelGroup(window) {
         const group = new Adw.PreferencesGroup({
             title: 'Speech Models',
-            description: 'Sherpa-onnx models for hotword, VAD, and Whisper ASR',
+            description: 'Sherpa-onnx models for hotword, streaming command ASR, VAD, and Whisper typing',
         });
 
         this._group = group;
@@ -97,7 +104,7 @@ export class WhisperModelManager {
 
         const downloadRow = new Adw.ActionRow({
             title: 'Download All Models',
-            subtitle: 'Downloads hotword, Whisper, and VAD models (~95 MB total)',
+            subtitle: 'Downloads hotword, streaming ASR, Whisper, and VAD (~210 MB total)',
         });
         const downloadButton = new Gtk.Button({
             icon_name: 'folder-download-symbolic',
@@ -146,6 +153,40 @@ export class WhisperModelManager {
             }
             enumerator.close(null);
             return hasOnnx && (hasTokens || dirPath.endsWith('/speaker'));
+        } catch (e) {
+            return false;
+        }
+    }
+
+    _hasTransducerFiles(dirPath) {
+        const dir = Gio.File.new_for_path(dirPath);
+        if (!dir.query_exists(null)) {
+            return false;
+        }
+        try {
+            const enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            let hasEncoder = false;
+            let hasDecoder = false;
+            let hasJoiner = false;
+            let hasTokens = false;
+            while ((info = enumerator.next_file(null))) {
+                const name = info.get_name().toLowerCase();
+                if (name.includes('encoder') && name.ends_with('.onnx')) {
+                    hasEncoder = true;
+                }
+                if (name.includes('decoder') && name.ends_with('.onnx')) {
+                    hasDecoder = true;
+                }
+                if (name.includes('joiner') && name.ends_with('.onnx')) {
+                    hasJoiner = true;
+                }
+                if (name === 'tokens.txt') {
+                    hasTokens = true;
+                }
+            }
+            enumerator.close(null);
+            return hasEncoder && hasDecoder && hasJoiner && hasTokens;
         } catch (e) {
             return false;
         }

@@ -6,26 +6,24 @@ use tracing::{info, warn};
 
 /// Resolve ONNX Runtime provider string for sherpa-onnx.
 ///
-/// `"auto"` tries CUDA first when an NVIDIA GPU **and** a CUDA-12-compatible
-/// cuBLAS runtime are present. Sherpa's published GPU packs need
-/// `libcublasLt.so.12`; Arch CUDA 13 only ships `.so.13`, and probing CUDA in
-/// that case aborts the process inside ONNX Runtime.
+/// `"auto"` tries CUDA first when an NVIDIA GPU and a matching system cuBLAS
+/// runtime are present (`.so.12` or `.so.13`, depending on the toolkit).
 pub fn resolve_provider(requested: &str) -> Vec<&'static str> {
     match requested.trim().to_ascii_lowercase().as_str() {
         "cuda" | "gpu" => {
-            if cuda12_runtime_available() {
+            if cuda_runtime_available() {
                 vec!["cuda", "cpu"]
             } else {
                 warn!(
-                    "Requested CUDA but libcublasLt.so.12 was not found \
-                     (toolkit may be CUDA 13+). Falling back to CPU."
+                    "Requested CUDA but libcublasLt was not found on the library path. \
+                     Falling back to CPU."
                 );
                 vec!["cpu"]
             }
         }
         "cpu" => vec!["cpu"],
         _ => {
-            if nvidia_gpu_present() && cuda12_runtime_available() {
+            if nvidia_gpu_present() && cuda_runtime_available() {
                 vec!["cuda", "cpu"]
             } else {
                 vec!["cpu"]
@@ -52,20 +50,15 @@ pub fn nvidia_gpu_present() -> bool {
             .unwrap_or(false)
 }
 
-/// Sherpa CUDA 12.x GPU builds dynamically load `libcublasLt.so.12`.
-pub fn cuda12_runtime_available() -> bool {
+/// True when a cuBLAS Lt shared library for CUDA 12+ is discoverable.
+pub fn cuda_runtime_available() -> bool {
     for dir in cuda_lib_search_dirs() {
-        if dir.join("libcublasLt.so.12").is_file() {
+        if dir.join("libcublasLt.so.13").is_file() || dir.join("libcublasLt.so.12").is_file() {
             return true;
         }
-        // Some layouts only ship the unversioned soname symlink.
         let unversioned = dir.join("libcublasLt.so");
         if unversioned.is_file() {
-            if let Ok(target) = std::fs::read_link(&unversioned) {
-                if target.to_string_lossy().contains("libcublasLt.so.12") {
-                    return true;
-                }
-            }
+            return true;
         }
     }
     false
@@ -83,19 +76,10 @@ fn cuda_lib_search_dirs() -> Vec<PathBuf> {
     }
     dirs.extend([
         PathBuf::from("/usr/lib"),
-        PathBuf::from("/usr/local/cuda/lib64"),
-        PathBuf::from("/opt/cuda/lib64"),
         PathBuf::from("/opt/cuda/targets/x86_64-linux/lib"),
-        PathBuf::from("/usr/local/cuda-12/lib64"),
-        PathBuf::from("/usr/local/cuda-12.4/lib64"),
-        PathBuf::from("/usr/local/cuda-12.6/lib64"),
+        PathBuf::from("/opt/cuda/lib64"),
+        PathBuf::from("/usr/local/cuda/lib64"),
     ]);
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".cache/willow/cuda12-compat/lib"));
-    }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        dirs.push(PathBuf::from(xdg).join("willow/cuda12-compat/lib"));
-    }
     dirs
 }
 
@@ -107,11 +91,10 @@ pub fn log_provider_choice(requested: &str, active: &str) {
     if requested.eq_ignore_ascii_case("cuda") || requested.eq_ignore_ascii_case("auto") {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
-            if nvidia_gpu_present() && !cuda12_runtime_available() {
+            if nvidia_gpu_present() && !cuda_runtime_available() {
                 warn!(
-                    "NVIDIA GPU present but CUDA 12 cuBLAS (libcublasLt.so.12) is missing — \
-                     using CPU. Run ./deploy-dev.sh to fetch CUDA 12 compat libs into \
-                     ~/.cache/willow/cuda12-compat (keeps system CUDA 13)."
+                    "NVIDIA GPU present but cuBLAS runtime was not found — using CPU. \
+                     Install the cuda toolkit and re-run ./deploy-dev.sh."
                 );
             } else {
                 warn!(

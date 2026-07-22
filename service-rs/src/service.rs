@@ -7,8 +7,10 @@ use anyhow::Result;
 use tracing::error;
 
 use crate::audio::MicCapture;
-use crate::commands::{CommandExecutor, CommandIntentResolver, CommandWorker};
+use crate::commands::{CommandExecutor, CommandWorker};
 use crate::config::{load_config, save_config, WillowConfig};
+use crate::intent::IntentEngine;
+use crate::llm::LlmFallback;
 use crate::modes::ModeStateMachine;
 use crate::models::{keyword_encoding_available, ModelPaths};
 use crate::pipeline::SpeechPipeline;
@@ -74,18 +76,19 @@ impl ServiceInner {
     fn handle_transcription(
         &mut self,
         result: &TranscriptionResult,
-    ) -> Option<crate::modes::ModeChange> {
+    ) -> crate::modes::TranscriptionOutcome {
         self.mode_machine
             .handle_transcription(result, &mut self.pipeline)
     }
 
-    /// Fast path under the service lock: AGC, KWS, VAD — no Whisper.
+    /// Fast path under the service lock: AGC, KWS, streaming ASR / VAD — no Whisper.
     fn process_audio_pre_whisper(
         &mut self,
         chunk: &[f32],
     ) -> (
         Vec<ServiceEvent>,
         Vec<Vec<f32>>,
+        Vec<TranscriptionResult>,
         Arc<crate::pipeline::WhisperEngine>,
         f32,
     ) {
@@ -94,10 +97,15 @@ impl ServiceInner {
         let whisper = self.pipeline.whisper_handle();
         let pre_pad = self.pipeline.whisper_pre_pad();
         let segments = pipeline_events.speech_segments;
+        let stream_results = pipeline_events.stream_results;
 
         for keyword in &pipeline_events.keywords {
-            if matches!(keyword.as_str(), "command" | "typing") && !self.pipeline.ready_for_command()
-            {
+            let asr_ok = match keyword.as_str() {
+                "command" => self.pipeline.ready_for_command(),
+                "typing" => self.pipeline.ready_for_typing(),
+                _ => true,
+            };
+            if !asr_ok {
                 self.push_asr_unavailable_once(&mut events);
                 continue;
             }
@@ -118,6 +126,37 @@ impl ServiceInner {
             events.push(ServiceEvent::CommandPending { phrase, blocked });
         }
 
+        // Streaming command partials / endpoints (handled under lock — no GPU Whisper).
+        for result in &stream_results {
+            events.push(ServiceEvent::PartialBufferChanged {
+                partial: result.text.clone(),
+                is_final: result.is_final || result.is_endpoint,
+            });
+            if matches!(self.mode_machine.mode(), Mode::Command) {
+                events.push(ServiceEvent::BufferChanged(result.text.clone()));
+            }
+            let outcome = self.handle_transcription(result);
+            if let Some(change) = outcome.mode_change {
+                events.push(ServiceEvent::ModeChanged {
+                    new_mode: change.new_mode.as_str().to_string(),
+                    old_mode: change.old_mode.as_str().to_string(),
+                });
+            }
+            if let Some(prompt) = outcome.prompt {
+                events.push(ServiceEvent::CommandPending {
+                    phrase: prompt,
+                    blocked: true,
+                });
+            }
+            if let Some(pending) = outcome.pending_phrase {
+                events.push(ServiceEvent::CommandPending {
+                    phrase: pending,
+                    blocked: true,
+                });
+            }
+            events.push(ServiceEvent::StatusChanged);
+        }
+
         self.collect_enrollment_events(&mut events);
 
         if let Some(change) = self.mode_machine.tick_idle(&mut self.pipeline) {
@@ -128,7 +167,7 @@ impl ServiceInner {
             events.push(ServiceEvent::StatusChanged);
         }
 
-        (events, segments, whisper, pre_pad)
+        (events, segments, stream_results, whisper, pre_pad)
     }
 
     fn push_asr_unavailable_once(&mut self, events: &mut Vec<ServiceEvent>) {
@@ -138,10 +177,11 @@ impl ServiceInner {
         self.asr_unavailable_notified = true;
         events.push(ServiceEvent::Error {
             message: "ASR Unavailable".into(),
-            details: "Whisper/VAD models missing — run ./deploy-dev.sh or willow-download-model"
+            details: "Streaming ASR / Whisper models missing — run ./deploy-dev.sh or willow-download-model"
                 .into(),
         });
     }
+
     fn finish_with_transcripts(&mut self, texts: Vec<String>) -> Vec<ServiceEvent> {
         let mut events = Vec::new();
         for text in texts {
@@ -149,6 +189,8 @@ impl ServiceInner {
                 text: text.clone(),
                 is_final: true,
                 is_endpoint: true,
+                from_whisper: true,
+                is_stable: true,
             };
             events.push(ServiceEvent::PartialBufferChanged {
                 partial: text.clone(),
@@ -157,10 +199,17 @@ impl ServiceInner {
             if matches!(self.mode_machine.mode(), Mode::Command | Mode::Typing) {
                 events.push(ServiceEvent::BufferChanged(text));
             }
-            if let Some(change) = self.handle_transcription(&result) {
+            let outcome = self.handle_transcription(&result);
+            if let Some(change) = outcome.mode_change {
                 events.push(ServiceEvent::ModeChanged {
                     new_mode: change.new_mode.as_str().to_string(),
                     old_mode: change.old_mode.as_str().to_string(),
+                });
+            }
+            if let Some(prompt) = outcome.prompt {
+                events.push(ServiceEvent::CommandPending {
+                    phrase: prompt,
+                    blocked: true,
                 });
             }
             events.push(ServiceEvent::StatusChanged);
@@ -195,15 +244,7 @@ impl ServiceInner {
             events.push(ServiceEvent::StatusChanged);
         } else if self.pipeline.speaker.should_prompt_for_speech() {
             self.pipeline.speaker.mark_speech_prompt_sent();
-            let prompt = self.pipeline.speaker.current_enrollment_prompt();
-            if !prompt.is_empty() {
-                events.push(ServiceEvent::Notification {
-                    title: "Voice Enrollment".into(),
-                    message: prompt.into(),
-                    urgency: "normal".into(),
-                });
-                events.push(ServiceEvent::StatusChanged);
-            }
+            events.push(ServiceEvent::StatusChanged);
         }
 
         if self.pipeline.speaker.enrollment_progress() >= 3 {
@@ -224,7 +265,8 @@ impl ServiceCore {
         let config = load_config().unwrap_or_default();
         let models_path = ModelPaths::from_home();
         let executor = Arc::new(CommandExecutor::new());
-        let resolver = CommandIntentResolver::new(executor.clone());
+        let intent = IntentEngine::new(executor.clone());
+        let llm = LlmFallback::new(config.inference.llm.clone());
         let command_executed_cb: Arc<Mutex<Option<Arc<dyn Fn(String, String, f64) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
         let cb_slot = command_executed_cb.clone();
@@ -236,7 +278,7 @@ impl ServiceCore {
                 }
             }),
         );
-        let mut pipeline = SpeechPipeline::new(models_path, resolver);
+        let mut pipeline = SpeechPipeline::new(models_path);
         let mut init_errors = Vec::new();
         if let Err(e) = pipeline.initialize(&config) {
             init_errors.push(format!("Pipeline init: {e}"));
@@ -250,7 +292,7 @@ impl ServiceCore {
             inner: Arc::new(Mutex::new(ServiceInner {
                 config: config.clone(),
                 pipeline,
-                mode_machine: ModeStateMachine::new(worker),
+                mode_machine: ModeStateMachine::new(worker, intent, llm),
                 listening_desired: true,
                 audio_active: false,
                 is_running: false,
@@ -295,16 +337,25 @@ impl ServiceCore {
         if new_mode == old {
             return Ok(());
         }
-        if matches!(new_mode, Mode::Command | Mode::Typing) && !st.pipeline.ready_for_command() {
+        if matches!(new_mode, Mode::Command) && !st.pipeline.ready_for_command() {
             let mut events = Vec::new();
             st.push_asr_unavailable_once(&mut events);
             drop(st);
             for ev in events {
                 self.emit(ev);
             }
-            anyhow::bail!("ASR models not loaded — cannot enter {mode} mode");
+            anyhow::bail!("Streaming ASR model not loaded — cannot enter command mode");
         }
-        if st.pipeline.ready_for_command() {
+        if matches!(new_mode, Mode::Typing) && !st.pipeline.ready_for_typing() {
+            let mut events = Vec::new();
+            st.push_asr_unavailable_once(&mut events);
+            drop(st);
+            for ev in events {
+                self.emit(ev);
+            }
+            anyhow::bail!("Whisper model not loaded — cannot enter typing mode");
+        }
+        if st.pipeline.ready_for_command() || st.pipeline.ready_for_typing() {
             st.asr_unavailable_notified = false;
         }
         st.set_mode(new_mode);
@@ -352,7 +403,9 @@ impl ServiceCore {
         );
         map.insert(
             "models_loaded".into(),
-            zvariant::OwnedValue::from(st.pipeline.ready_for_command()),
+            zvariant::OwnedValue::from(
+                st.pipeline.ready_for_command() || st.pipeline.ready_for_typing(),
+            ),
         );
         map.insert(
             "kws_ready".into(),
@@ -363,12 +416,20 @@ impl ServiceCore {
             zvariant::OwnedValue::from(st.pipeline.asr_ready()),
         );
         map.insert(
+            "stream_asr_ready".into(),
+            zvariant::OwnedValue::from(st.pipeline.stream_ready()),
+        );
+        map.insert(
             "whisper_loaded".into(),
             zvariant::OwnedValue::from(st.pipeline.whisper_ready()),
         );
         map.insert(
             "whisper_ready".into(),
             zvariant::OwnedValue::from(st.pipeline.whisper_ready()),
+        );
+        map.insert(
+            "workflow_prompt".into(),
+            dbus_str(st.mode_machine.last_prompt().unwrap_or("")),
         );
         map.insert(
             "inference_provider".into(),
@@ -469,8 +530,8 @@ impl ServiceCore {
                     threshold /= 100.0;
                 }
                 st.config.command_threshold = threshold * 100.0;
-                let threshold_frac = st.config.command_threshold_fraction();
-                st.pipeline.resolver.set_threshold(threshold_frac);
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
             }
             "inference.provider" | "provider" => {
                 let provider: String = value.try_into()?;
@@ -479,19 +540,62 @@ impl ServiceCore {
                 st.pipeline.apply_config(&cfg)?;
             }
             "command_mode.endpoint_silence"
-            | "endpoint_silence"
-            | "processing_interval" => {
+            | "endpoint_silence" => {
                 let secs: f64 = value.try_into()?;
                 st.config.command_mode.endpoint_silence = (secs as f32).clamp(0.15, 2.0);
-                st.config.streaming_asr.endpoint_silence_command =
-                    st.config.command_mode.endpoint_silence;
+                st.config.streaming_asr.rule2_min_trailing_silence =
+                    (st.config.command_mode.endpoint_silence * 2.0).clamp(0.3, 1.5);
                 let cfg = st.config.clone();
                 st.pipeline.apply_config(&cfg)?;
                 st.mode_machine.apply_config(&cfg);
             }
-            "command_mode.incomplete_hold" | "incomplete_hold" => {
+            "workflows.session_timeout" | "session_timeout" => {
                 let secs: f64 = value.try_into()?;
-                st.config.command_mode.incomplete_hold = (secs as f32).clamp(0.3, 8.0);
+                st.config.workflows.session_timeout = (secs as f32).clamp(2.0, 120.0);
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "intent.early_fire" | "early_fire" => {
+                let enabled: bool = value.try_into()?;
+                st.config.intent.early_fire = enabled;
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "intent.llm_fallback" | "llm_fallback" | "llm-enabled" => {
+                let enabled: bool = value.try_into()?;
+                st.config.intent.llm_fallback = enabled;
+                st.config.inference.llm.enabled = enabled;
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "inference.llm.enabled" | "llm.enabled" => {
+                let enabled: bool = value.try_into()?;
+                st.config.inference.llm.enabled = enabled;
+                st.config.intent.llm_fallback = enabled;
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "inference.llm.model_path" | "llm.model_path" => {
+                let path: String = value.try_into()?;
+                st.config.inference.llm.model_path = path;
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "inference.llm.max_tokens" | "llm.max_tokens" => {
+                let tokens: i32 = value.try_into()?;
+                st.config.inference.llm.max_tokens = tokens.clamp(16, 256);
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "inference.llm.timeout_ms" | "llm.timeout_ms" => {
+                let ms: i32 = value.try_into()?;
+                st.config.inference.llm.timeout_ms = ms.clamp(100, 5000);
+                let cfg = st.config.clone();
+                st.mode_machine.apply_config(&cfg);
+            }
+            "typing_mode.auto_revert" | "typing_auto_revert" => {
+                let enabled: bool = value.try_into()?;
+                st.config.typing_mode.auto_revert = enabled;
                 let cfg = st.config.clone();
                 st.mode_machine.apply_config(&cfg);
             }
@@ -516,10 +620,8 @@ impl ServiceCore {
             command: command.to_string(),
             phrases,
         });
-        let commands = st.config.commands.clone();
-        st.pipeline.resolver.set_commands(commands);
         let cfg = st.config.clone();
-        st.pipeline.apply_config(&cfg)?;
+        st.mode_machine.apply_config(&cfg);
         save_config(&st.config)?;
         drop(st);
         self.emit(ServiceEvent::StatusChanged);
@@ -529,8 +631,8 @@ impl ServiceCore {
     pub fn remove_command(&self, name: &str) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
         st.config.commands.retain(|c| c.name != name);
-        let commands = st.config.commands.clone();
-        st.pipeline.resolver.set_commands(commands);
+        let cfg = st.config.clone();
+        st.mode_machine.apply_config(&cfg);
         save_config(&st.config)?;
         drop(st);
         self.emit(ServiceEvent::StatusChanged);
@@ -617,20 +719,6 @@ impl ServiceCore {
             st.pipeline.speaker.start_enrollment(&user);
         }
         self.emit(ServiceEvent::StatusChanged);
-        let prompt = self
-            .inner
-            .lock()
-            .unwrap()
-            .pipeline
-            .speaker
-            .current_enrollment_prompt();
-        if !prompt.is_empty() {
-            self.emit(ServiceEvent::Notification {
-                title: "Voice Enrollment".into(),
-                message: prompt.into(),
-                urgency: "normal".into(),
-            });
-        }
         Ok(())
     }
 
@@ -704,30 +792,11 @@ impl ServiceCore {
         let inner = self.inner.clone();
         let tx_audio = tx.clone();
         let (handle, stop) = MicCapture::start(move |chunk| {
-            let (mut events, segments, whisper, pre_pad) = {
+            let (mut events, segments, _stream_results, whisper, pre_pad) = {
                 let mut st = inner.lock().unwrap();
                 st.process_audio_pre_whisper(chunk)
             };
-            // Whisper outside the service mutex so D-Bus stays responsive.
-            // In command mode, join segments from the same flush so a split phrase
-            // is transcribed once instead of as isolated scraps.
-            let segments = {
-                let mode = {
-                    let st = inner.lock().unwrap();
-                    st.mode_machine.mode()
-                };
-                if matches!(mode, crate::types::Mode::Command) && segments.len() > 1 {
-                    let mut joined = Vec::new();
-                    let total: usize = segments.iter().map(|s| s.len()).sum();
-                    joined.reserve(total);
-                    for seg in segments {
-                        joined.extend_from_slice(&seg);
-                    }
-                    vec![joined]
-                } else {
-                    segments
-                }
-            };
+            // Typing: Whisper outside the service mutex.
             let texts: Vec<String> = segments
                 .into_iter()
                 .filter_map(|seg| {
